@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from livekit.agents import Plugin
 
+from . import realtime
+from .realtime import RealtimeModel, RealtimeSession
 from .tts import (
     TTS,
     AudioFormat,
@@ -39,6 +41,9 @@ __all__ = [
     "VoiceByName",
     "VoiceProvider",
     "Utterance",
+    "realtime",
+    "RealtimeModel",
+    "RealtimeSession",
 ]
 
 
