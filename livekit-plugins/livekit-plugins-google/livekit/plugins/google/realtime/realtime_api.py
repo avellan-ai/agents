@@ -25,7 +25,12 @@ from livekit.agents.types import (
     NotGivenOr,
 )
 from livekit.agents.utils import audio as audio_utils, images, is_given
-from livekit.plugins.google.realtime.api_proto import ClientEvents, LiveAPIModels, Voice
+from livekit.plugins.google.realtime.api_proto import (
+    RESTRICTED_CLIENT_CONTENT_MODELS,
+    ClientEvents,
+    LiveAPIModels,
+    Voice,
+)
 
 from ..log import logger
 from ..utils import create_tools_config, get_tool_results_for_realtime
@@ -43,6 +48,37 @@ DEFAULT_IMAGE_ENCODE_OPTIONS = images.EncodeOptions(
 )
 
 lk_google_debug = int(os.getenv("LK_GOOGLE_DEBUG", 0))
+
+
+def _uses_realtime_text_updates(model: str) -> bool:
+    return model in RESTRICTED_CLIENT_CONTENT_MODELS
+
+
+def _format_context_update(text: str) -> str:
+    return (
+        "Application context update. This message is supplied by the application, "
+        "not the user. Apply it silently to future turns and do not respond to "
+        f"this update.\n\n{text}"
+    )
+
+
+def _format_generation_prompt(instructions: NotGivenOr[str]) -> str:
+    if is_given(instructions) and instructions is not None and instructions.strip():
+        return (
+            "Application instruction for your next spoken response. Follow this "
+            f"instruction now:\n\n{instructions}"
+        )
+    return "Continue the conversation with an appropriate spoken response."
+
+
+def _chat_message_text(message: llm.ChatMessage) -> str | None:
+    text = (message.text_content or "").strip()
+    if not text:
+        return None
+
+    role = "model" if message.role == "assistant" else message.role
+    return f"{role}: {text}"
+
 
 # Known VertexAI models for the Live API
 # See: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api
@@ -286,7 +322,8 @@ class RealtimeModel(llm.RealtimeModel):
                 else "gemini-2.5-flash-native-audio-preview-12-2025"
             )
 
-        mutable = "3.1" not in model
+        uses_realtime_text_updates = _uses_realtime_text_updates(model)
+        mutable = "3.1" not in model or uses_realtime_text_updates
         super().__init__(
             capabilities=llm.RealtimeCapabilities(
                 message_truncation=False,
@@ -336,7 +373,7 @@ class RealtimeModel(llm.RealtimeModel):
         # Validate model/API compatibility for known models
         _validate_model_api_match(model, use_vertexai)
 
-        if "3.1" in model:
+        if "3.1" in model and not uses_realtime_text_updates:
             logger.warning(
                 f"'{model}' has limited mid-session update support. instructions, chat "
                 "context, and tool updates will not be applied until the next session."
@@ -568,6 +605,12 @@ class RealtimeSession(llm.RealtimeSession):
             if not self._realtime_model.capabilities.mutable_instructions:
                 return
 
+            if _uses_realtime_text_updates(self._opts.model):
+                self._send_client_event(
+                    types.LiveClientRealtimeInput(text=_format_context_update(instructions))
+                )
+                return
+
             # Active session exists — send mid-session system instruction update (no reconnect needed)
             logger.debug("Updating instructions mid-session")
             self._send_client_event(
@@ -626,14 +669,28 @@ class RealtimeSession(llm.RealtimeSession):
                 tool_response_scheduling=self._opts.tool_response_scheduling,
             )
             if self._realtime_model.capabilities.mutable_chat_context:
-                turns_dict, _ = append_ctx.copy(exclude_function_call=True).to_provider_format(
-                    format="google", inject_dummy_user_message=False
-                )
-                turns = [types.Content.model_validate(turn) for turn in turns_dict]
-                if turns:
-                    self._send_client_event(
-                        types.LiveClientContent(turns=turns, turn_complete=False)
+                if _uses_realtime_text_updates(self._opts.model):
+                    message_texts = [
+                        message_text
+                        for item in append_ctx.items
+                        if isinstance(item, llm.ChatMessage)
+                        if (message_text := _chat_message_text(item)) is not None
+                    ]
+                    if message_texts:
+                        self._send_client_event(
+                            types.LiveClientRealtimeInput(
+                                text=_format_context_update("\n".join(message_texts))
+                            )
+                        )
+                else:
+                    turns_dict, _ = append_ctx.copy(exclude_function_call=True).to_provider_format(
+                        format="google", inject_dummy_user_message=False
                     )
+                    turns = [types.Content.model_validate(turn) for turn in turns_dict]
+                    if turns:
+                        self._send_client_event(
+                            types.LiveClientContent(turns=turns, turn_complete=False)
+                        )
             if tool_results:
                 self._send_client_event(tool_results)
 
@@ -731,12 +788,17 @@ class RealtimeSession(llm.RealtimeSession):
             self._in_user_activity = False
 
         # Gemini requires the last message to end with user's turn
-        # so we need to add a placeholder user turn in order to trigger a new generation
-        turns = []
-        if is_given(instructions):
-            turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
-        turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
-        self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
+        # so we need to add a placeholder user turn in order to trigger a new generation.
+        if _uses_realtime_text_updates(self._opts.model):
+            self._send_client_event(
+                types.LiveClientRealtimeInput(text=_format_generation_prompt(instructions))
+            )
+        else:
+            turns = []
+            if is_given(instructions):
+                turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
+            turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
+            self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
 
         def _on_timeout() -> None:
             if not fut.done():
@@ -931,6 +993,12 @@ class RealtimeSession(llm.RealtimeSession):
                     ):
                         break
                 if isinstance(msg, types.LiveClientContent):
+                    if _uses_realtime_text_updates(self._opts.model):
+                        logger.debug(
+                            "dropping LiveClientContent event because this Gemini Live model "
+                            "only supports send_client_content for initial history seeding"
+                        )
+                        continue
                     await session.send_client_content(
                         turns=msg.turns,  # type: ignore
                         turn_complete=msg.turn_complete if msg.turn_complete is not None else True,
@@ -1063,7 +1131,7 @@ class RealtimeSession(llm.RealtimeSession):
         conf = types.LiveConnectConfig(
             response_modalities=self._opts.response_modalities,
             history_config=types.HistoryConfig(initial_history_in_client_content=True)
-            if not self._realtime_model.capabilities.mutable_chat_context
+            if _uses_realtime_text_updates(self._opts.model)
             else None,
             generation_config=types.GenerationConfig(
                 candidate_count=self._opts.candidate_count,
@@ -1161,6 +1229,17 @@ class RealtimeSession(llm.RealtimeSession):
         self.emit("generation_created", generation_event)
 
     def _handle_server_content(self, server_content: types.LiveServerContent) -> None:
+        has_content = (
+            server_content.model_turn
+            or server_content.output_transcription
+            or server_content.input_transcription
+            or server_content.turn_complete is not None
+            or server_content.generation_complete is not None
+            or server_content.interrupted is not None
+        )
+        if not has_content:
+            return
+
         current_gen = self._current_generation
         if not current_gen:
             logger.warning("received server content but no active generation.")

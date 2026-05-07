@@ -19,6 +19,15 @@ LiveAPIModels = Literal[
     "gemini-2.5-flash-native-audio-preview-12-2025",  # https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-live
 ]
 
+RESTRICTED_CLIENT_CONTENT_MODELS: frozenset[str] = frozenset(
+    {
+        # Gemini 3.1 only accepts send_client_content for initial history seeding.
+        # Mid-session text/context updates must use send_realtime_input(text=...).
+        # https://ai.google.dev/gemini-api/docs/live-api/capabilities
+        "gemini-3.1-flash-live-preview",
+    }
+)
+
 Voice = Literal[
     "Achernar",
     "Achird",
