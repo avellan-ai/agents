@@ -84,6 +84,7 @@ from openai.types.realtime.realtime_session_create_response import (
     Tracing,
 )
 from openai.types.realtime.realtime_truncation import RealtimeTruncation
+from openai.types.shared import Reasoning
 
 from ..log import logger
 from ..models import RealtimeModels
@@ -223,6 +224,7 @@ class _RealtimeOptions:
     input_audio_noise_reduction: NoiseReduction | None
     turn_detection: RealtimeAudioInputTurnDetection | None
     max_response_output_tokens: int | Literal["inf"] | None
+    reasoning: Reasoning | None
     tracing: Tracing | None
     truncation: RealtimeTruncation | None
     api_key: str | None
@@ -280,6 +282,7 @@ class RealtimeModel(llm.RealtimeModel):
         ] = NOT_GIVEN,
         tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN,
         speed: NotGivenOr[float] = NOT_GIVEN,
+        reasoning: NotGivenOr[Reasoning | None] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
         api_key: str | None = None,
@@ -312,6 +315,7 @@ class RealtimeModel(llm.RealtimeModel):
         ] = NOT_GIVEN,
         tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN,
         speed: NotGivenOr[float] = NOT_GIVEN,
+        reasoning: NotGivenOr[Reasoning | None] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
@@ -338,6 +342,7 @@ class RealtimeModel(llm.RealtimeModel):
             RealtimeAudioInputTurnDetection | TurnDetection | None
         ] = NOT_GIVEN,
         speed: NotGivenOr[float] = NOT_GIVEN,
+        reasoning: NotGivenOr[Reasoning | None] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
         api_key: str | None = None,
@@ -362,6 +367,7 @@ class RealtimeModel(llm.RealtimeModel):
             input_audio_noise_reduction (NoiseReductionType | NoiseReduction | InputAudioNoiseReduction | None | NotGiven): Input audio noise reduction settings.
             turn_detection (RealtimeAudioInputTurnDetection | None | NotGiven): Server-side turn-detection options.
             speed (float | NotGiven): Audio playback speed multiplier.
+            reasoning (Reasoning | None | NotGiven): Reasoning configuration for supported Realtime models.
             tracing (Tracing | None | NotGiven): Tracing configuration for OpenAI Realtime.
             truncation (RealtimeTruncation | None | NotGiven): Truncation configuration for OpenAI Realtime.
             api_key (str | None): OpenAI API key. If None and not using Azure, read from OPENAI_API_KEY.
@@ -467,6 +473,7 @@ class RealtimeModel(llm.RealtimeModel):
             api_version=api_version,
             max_response_output_tokens=DEFAULT_MAX_RESPONSE_OUTPUT_TOKENS,  # type: ignore
             speed=speed if is_given(speed) else 1.0,
+            reasoning=reasoning if is_given(reasoning) else None,
             tracing=tracing if is_given(tracing) else None,
             truncation=truncation if is_given(truncation) else None,
             max_session_duration=max_session_duration
@@ -662,6 +669,7 @@ class RealtimeModel(llm.RealtimeModel):
         ] = NOT_GIVEN,
         max_response_output_tokens: NotGivenOr[int | Literal["inf"] | None] = NOT_GIVEN,
         speed: NotGivenOr[float] = NOT_GIVEN,
+        reasoning: NotGivenOr[Reasoning | None] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
         temperature: NotGivenOr[float] = NOT_GIVEN,  # deprecated, unused in v1
@@ -687,6 +695,9 @@ class RealtimeModel(llm.RealtimeModel):
         if is_given(speed):
             self._opts.speed = speed
 
+        if is_given(reasoning):
+            self._opts.reasoning = reasoning
+
         if is_given(tracing):
             self._opts.tracing = tracing
 
@@ -702,6 +713,7 @@ class RealtimeModel(llm.RealtimeModel):
                 input_audio_noise_reduction=self._opts.input_audio_noise_reduction,
                 max_response_output_tokens=max_response_output_tokens,
                 speed=speed,
+                reasoning=reasoning,
                 tracing=tracing,
                 truncation=truncation,
             )
@@ -1181,6 +1193,8 @@ class RealtimeSession(
             tool_choice=to_oai_tool_choice(opts.tool_choice),
             tracing=opts.tracing,
         )
+        if opts.reasoning is not None:
+            session = session.model_copy(update={"reasoning": opts.reasoning})
         if self._instructions is not None:
             session.instructions = self._instructions
         if opts.truncation is not None:
@@ -1210,11 +1224,18 @@ class RealtimeSession(
             NoiseReductionType | NoiseReduction | InputAudioNoiseReduction | None
         ] = NOT_GIVEN,
         speed: NotGivenOr[float] = NOT_GIVEN,
+        reasoning: NotGivenOr[Reasoning | None] = NOT_GIVEN,
         tracing: NotGivenOr[Tracing | None] = NOT_GIVEN,
         truncation: NotGivenOr[RealtimeTruncation | None] = NOT_GIVEN,
     ) -> None:
         session = RealtimeSessionCreateRequest(type="realtime")
         has_changes = False
+
+        if is_given(reasoning):
+            if self._opts.reasoning != reasoning:
+                session = RealtimeSessionCreateRequest(type="realtime", reasoning=reasoning)
+                has_changes = True
+            self._opts.reasoning = reasoning
 
         if is_given(tool_choice):
             current_oai = to_oai_tool_choice(self._opts.tool_choice)

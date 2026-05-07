@@ -58,6 +58,7 @@ ChatModels = Literal[
     "gpt-3.5-turbo-16k-0613",
 ]
 RealtimeModels = Literal[
+    "gpt-realtime-2",
     "gpt-realtime",
     "gpt-realtime-1.5",
     "gpt-realtime-2025-08-28",
