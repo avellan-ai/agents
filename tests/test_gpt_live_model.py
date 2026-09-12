@@ -680,7 +680,12 @@ async def test_client_delegation_reaches_the_application_and_is_answered(
         )
         # a plugin type, not the wire event: the wire shape must not reach the application
         assert delegations == [
-            GPTLiveDelegation(id="item_delegation_123", pending_transcript="What is the weather")
+            GPTLiveDelegation(
+                id="item_delegation_123",
+                pending_transcript="What is the weather",
+                pending_message_id=session._speech["user"].message_id,
+                pending_message_created_at=session._speech["user"].started_at,
+            )
         ]
 
         session.append_commentary("62 and raining.", delegation_id=delegations[0].id)
@@ -841,13 +846,16 @@ async def test_delayed_context_receipts_do_not_block_commands_or_finish_speech(
 
         # Context injection can outlast the connection timeout without holding later commands.
         await asyncio.sleep(model._opts.conn_options.timeout * 2)
-        assert [event["type"] for event in ws.sent] == [
+        # Idle microphone padding shares the wire without blocking context commands.
+        assert [
+            event["type"] for event in ws.sent if event["type"] != "session.input_audio.append"
+        ] == [
             "session.start",
             "session.instructions.append",
             "session.thinking.append",
             "session.commentary.append",
-            "session.input_audio.append",
         ]
+        assert any(event["type"] == "session.input_audio.append" for event in ws.sent)
         assert not errors
         assert not generations
 
@@ -977,7 +985,7 @@ async def test_a_backend_function_call_is_answered_and_the_response_continued(
         session._handle_event(_response_event("item_d1", _completed("resp_1")))
         await asyncio.sleep(0.05)
         assert ws.sent[-1]["type"] == "response.create"
-        assert not session._backend_running_responses and not session._backend_open_calls
+        assert not session._delegated_responses and not session._fnc_call_to_delegation
     finally:
         await session.aclose()
         await model.aclose()
@@ -1060,7 +1068,7 @@ async def test_a_continuation_waits_for_every_open_call_in_the_conversation(
             "response.item.create",
             "response.create",
         ]
-        assert not session._backend_running_responses and not session._backend_open_calls
+        assert not session._delegated_responses and not session._fnc_call_to_delegation
     finally:
         await session.aclose()
         await model.aclose()
@@ -1104,7 +1112,9 @@ async def test_a_failed_response_releases_the_continuation_it_held_back(
             [llm.FunctionCallOutput(call_id="call_2", output="two", is_error=False)]
         )
         await asyncio.sleep(0.05)
-        assert ws.sent[-1]["type"] == "session.thinking.append"
+        # the input clock keeps idle microphone silence flowing, so skip its audio appends
+        sent = [e["type"] for e in ws.sent if e["type"] != "session.input_audio.append"]
+        assert sent[-1] == "session.thinking.append"
     finally:
         await session.aclose()
         await model.aclose()
@@ -1132,7 +1142,7 @@ async def test_noncompleted_backend_calls_are_not_dispatched(
             event["item"]["status"] = status
         session._handle_event(_response_event("item_d1", event))
         assert not calls
-        assert not session._backend_running_responses["item_d1"]
+        assert not session._delegated_responses["item_d1"].call_ids
         assert not [item for item in session._history.items if isinstance(item, llm.FunctionCall)]
 
         # A later completed event for the same call must still be dispatched.
@@ -1161,7 +1171,7 @@ async def test_backend_calls_with_missing_fields_are_not_dispatched(
         del event["item"][missing_field]
         session._handle_event(_response_event("item_d1", event))
         assert not calls
-        assert not session._backend_running_responses["item_d1"]
+        assert not session._delegated_responses["item_d1"].call_ids
         assert not [item for item in session._history.items if isinstance(item, llm.FunctionCall)]
 
         session._handle_event(_response_event("item_d1", _function_call_done("call_1")))
@@ -1322,8 +1332,8 @@ async def test_fragments_are_forwarded_and_mirrored_as_growing_messages(
 
 
 async def test_the_callers_turn_ends_on_their_own_audio(monkeypatch: pytest.MonkeyPatch) -> None:
-    """There are no turn events: the caller's fragments accumulate, and a second of their audio
-    pushed with no new fragment ends the turn."""
+    """There are no turn events: the caller's fragments accumulate, and sustained non-speech
+    input after the latest fragment ends the turn."""
     _connect_hook(monkeypatch)
 
     model = GPTLiveModel(api_key="sk-test")
@@ -1353,6 +1363,14 @@ async def test_the_callers_turn_ends_on_their_own_audio(monkeypatch: pytest.Monk
         assert len(events) == 3  # quiet, but not yet for the whole pause
 
         session.push_audio(_silence(100))
+        # The native detector processes 32 ms windows asynchronously.
+        session.push_audio(_silence(32))
+
+        async def detected() -> None:
+            while "user" in session._speech:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(detected(), timeout=2)
         assert [name for name, _ in events[-2:]] == [
             "input_audio_transcription_completed",
             "input_speech_stopped",
@@ -1435,7 +1453,9 @@ async def test_a_typed_message_rides_in_the_ask_while_it_is_the_newest_thing_sai
 
         session._generate_reply()  # the same message is not asked about twice
         await asyncio.sleep(0.05)
-        assert ws.sent[-1]["content"] == gpt_live_model._ASK_BARE
+        assert [e for e in ws.sent if e["type"] == "session.commentary.append"][-1][
+            "content"
+        ] == gpt_live_model._ASK_BARE
 
         await session._append_items(
             [llm.ChatMessage(role="user", content=["Never mind."], id="typed_2")]
@@ -1443,7 +1463,9 @@ async def test_a_typed_message_rides_in_the_ask_while_it_is_the_newest_thing_sai
         session._handle_event(_transcript("assistant", "Okay.", 1))
         session._generate_reply()  # speech has moved the conversation on since the typed message
         await asyncio.sleep(0.05)
-        assert ws.sent[-1]["content"] == gpt_live_model._ASK_BARE
+        assert [e for e in ws.sent if e["type"] == "session.commentary.append"][-1][
+            "content"
+        ] == gpt_live_model._ASK_BARE
     finally:
         await session.aclose()
         await model.aclose()
