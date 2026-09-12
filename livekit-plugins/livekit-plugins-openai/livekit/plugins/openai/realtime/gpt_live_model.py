@@ -5,6 +5,7 @@ import base64
 import contextlib
 import json
 import os
+import sys
 import time
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field, replace
@@ -14,7 +15,7 @@ from urllib.parse import urlparse, urlunparse
 import aiohttp
 
 from livekit import rtc
-from livekit.agents import APIConnectionError, APIError, llm, utils
+from livekit.agents import APIConnectionError, APIError, inference, llm, utils, vad
 from livekit.agents.metrics import LLMMetrics, RealtimeModelMetrics
 from livekit.agents.metrics.base import Metadata
 from livekit.agents.types import (
@@ -26,6 +27,7 @@ from livekit.agents.types import (
 from livekit.agents.utils import is_given
 from openai.types.responses import ResponseTextConfigParam
 from openai.types.responses.response_input_item import FunctionCallOutput
+from openai.types.responses.response_input_item_param import ResponseInputItemParam
 from openai.types.shared_params import Reasoning
 
 from ..log import logger
@@ -49,6 +51,10 @@ _SILENCE_RMS = 0.0006
 # long enough that a pause between sentences does not split an utterance in two
 _MIN_SILENCE_DURATION = 0.8
 _MIN_SILENCE_MS = _MIN_SILENCE_DURATION * 1000
+_INPUT_SPEECH_THRESHOLD = 0.5
+_INPUT_SPEECH_CONTINUATION_THRESHOLD = 0.35
+_INPUT_IDLE_S = 0.2
+_INPUT_CLOCK_FRAME_S = 0.1
 
 # the asks generate_reply sends as commentary. each ends with the same two sentences, which make
 # the model speak now rather than wait for the caller; what precedes them says what to speak
@@ -76,6 +82,15 @@ GPTLiveVoices = Literal["aster", "beacon", "cinder", "marin", "stone", "vesper"]
 lk_oai_debug = int(os.getenv("LK_OPENAI_DEBUG", 0))
 
 
+def _valid_usage_seconds(value: object) -> bool:
+    # Compare before float conversion: construct() can overflow on arbitrarily large JSON ints.
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 <= value <= sys.float_info.max
+    )
+
+
 class ResponsesDelegationOptions(TypedDict, total=False):
     """The backend Responses model delegated work runs on, under ``delegation="responses"``.
 
@@ -98,6 +113,22 @@ class ResponsesDelegationOptions(TypedDict, total=False):
 
 
 @dataclass
+class GPTLiveCommandReceipt:
+    """Local transport evidence, never a speech-delivery receipt.
+
+    Backend item/create commands have no correlated success acknowledgment, so their
+    successful transport status remains ``sent``. An append can become ``acknowledged``.
+    Retain this object for late errors. Reconnect never replays these commands.
+    """
+
+    event_id: str
+    connection_epoch: int
+    event_type: str
+    status: Literal["queued", "sent", "acknowledged", "error", "connection_lost"] = "queued"
+    error_code: str | None = None
+
+
+@dataclass
 class GPTLiveDelegation:
     """Work the model handed to the application, under client delegation.
 
@@ -108,6 +139,10 @@ class GPTLiveDelegation:
     id: str
     pending_transcript: str
     """The caller's current turn, not yet in the chat context when the model delegates."""
+    pending_message_id: str | None = None
+    """Stable message id shared with interim and final user transcript events, when speaking."""
+    pending_message_created_at: float | None = None
+    """Creation timestamp of that message, matching the transcript's ``turn_started_at``."""
 
 
 @dataclass
@@ -118,8 +153,10 @@ class _Speech:
     text: str = ""
     end_ms: int | None = None
     started_at: float = field(default_factory=time.time)
-    quiet_ms: int = 0
-    """Input audio pushed since the user's last fragment."""
+    quiet_ms: float = 0
+    """Consecutive non-speech input processed since the user's last fragment."""
+    input_audio_ms: float = 0
+    """Input queued when this fragment arrived; delayed inference cannot count older audio."""
 
 
 # Responses delegation hands work to a backend Responses model, whose events arrive wrapped in
@@ -134,9 +171,11 @@ class _Speech:
 class _DelegatedResponse:
     """The current response of one delegation, and the tool calls it waits on."""
 
+    response_id: str | None = None
     call_ids: set[str] = field(default_factory=set)
     returned: set[str] = field(default_factory=set)
     completed: bool = False
+    input_message_id: str | None = None
 
 
 @dataclass
@@ -274,12 +313,26 @@ class GPTLiveSession(
         self._msg_ch = utils.aio.Chan[types.ClientEvent | dict[str, Any]]()
         self._audio_ch = utils.aio.Chan[llm.DuplexAudioFrame]()
         self._input_resampler: rtc.AudioResampler | None = None
+        self._input_vad: vad.VADStream | None = None
+        self._input_vad_task: asyncio.Task[None] | None = None
+        self._input_audio_ms = 0.0
+        self._input_vad_ms = 0.0
+        self._input_speaking = False
+        self._input_resetting = False
+        self._input_muted = False
+        self._last_microphone_at = 0.0
+        self._input_audio_until = 0.0
+        self._startup_audio_duration = 0.0
 
         # session.start opens a connection and carries the config that is immutable after it
         self._session_start_sent = False
         self._session_started_fut: asyncio.Future[None] = asyncio.Future()
         self._session_closed_fut: asyncio.Future[None] = asyncio.Future()
         self._session_id: str | None = None
+        self._connection_epoch = 0
+        self._command_receipts: dict[str, GPTLiveCommandReceipt] = {}
+        self._backend_run_pending = False
+        self._backend_poisoned = False
         self._num_retries = 0
         # session usage is reported cumulatively; kept to emit per-event deltas
         self._usage_total = types.Usage()
@@ -292,7 +345,13 @@ class GPTLiveSession(
         # the current response per delegation and the delegation each tool call belongs to,
         # since the framework hands a result back by call id alone
         self._delegated_responses: dict[str | None, _DelegatedResponse] = {}
+        self._backend_input_message_id: str | None = None
+        self._last_final_input_id: str | None = None
+        self._delegation_input_ids: dict[str | None, str | None] = {}
         self._fnc_call_to_delegation: dict[str, str | None] = {}
+        # Keep dispatched ids beyond continuation/failure so duplicate delivery cannot run an
+        # already completed (possibly state-changing) tool again on this connection.
+        self._dispatched_call_ids: set[str] = set()
 
         # the newest history item the last ask was about, so an ask never repeats one
         self._asked_item_id: str | None = None
@@ -306,8 +365,166 @@ class GPTLiveSession(
     # outbound
 
     def send_event(self, event: types.ClientEvent | dict[str, Any]) -> None:
+        if self._msg_ch.closed:
+            return
+        event_type = event.get("type") if isinstance(event, dict) else event.type
+        if event_type in ("session.input_audio.mute", "session.input_audio.unmute"):
+            self._flush_input_audio()
         with contextlib.suppress(utils.aio.channel.ChanClosed):
             self._msg_ch.send_nowait(event)
+            if event_type in ("session.input_audio.mute", "session.input_audio.unmute"):
+                self._input_muted = event_type == "session.input_audio.mute"
+
+    @property
+    def connection_epoch(self) -> int:
+        """Local connection generation; backend context must be rebuilt after it changes."""
+        return self._connection_epoch
+
+    def _require_open(self) -> None:
+        if self._closing or self._msg_ch.closed or self._main_atask.done():
+            raise llm.RealtimeError("gpt-live session is closed")
+
+    def _queue_tracked(self, event: types.ClientEvent) -> GPTLiveCommandReceipt:
+        self._require_open()
+        event_id = getattr(event, "event_id", None)
+        assert isinstance(event_id, str)
+        receipt = GPTLiveCommandReceipt(event_id, self._connection_epoch, event.type)
+        self._command_receipts[event_id] = receipt
+        self.send_event(event)
+        return receipt
+
+    async def wait_started(self) -> None:
+        """Wait for provider startup without canceling the shared connection future."""
+        self._require_open()
+        await asyncio.shield(self._session_started_fut)
+        self._require_open()
+
+    @property
+    def backend_input_ready(self) -> bool:
+        """Whether a new managed input can be queued without joining active work."""
+        try:
+            self._require_backend_idle()
+        except llm.RealtimeError:
+            return False
+        return True
+
+    def _require_backend_idle(self) -> None:
+        self._require_open()
+        if self._opts.delegation != "responses":
+            raise llm.RealtimeError(
+                "backend input requires responses delegation; send images/text directly "
+                "to your application backend under client delegation"
+            )
+        if (
+            not self._session_start_sent
+            or not self._session_started_fut.done()
+            or self._session_started_fut.cancelled()
+            or self._session_closed_fut.done()
+        ):
+            raise llm.RealtimeError("wait for session.started before sending backend input")
+        if self._backend_poisoned:
+            raise llm.RealtimeError("backend command failed; rebuild context in a new session")
+        if self._backend_run_pending or self._delegated_responses:
+            raise llm.RealtimeError(
+                "backend is busy; wait for response completion and all pending tool results"
+            )
+
+    def queue_backend_input(
+        self, items: list[ResponseInputItemParam]
+    ) -> tuple[GPTLiveCommandReceipt, ...]:
+        """Queue Responses text/image messages without starting a response.
+
+        Only managed Responses delegation accepts this input. Frontend history is separate.
+        Call ``run_backend`` to request execution. Automatic voice delegation can also consume
+        queued backend context. Input while a response/tool batch is active is rejected so it
+        cannot accidentally join an automatic tool continuation. Rebuild from authoritative
+        application state after reconnect; uncertain submissions are never replayed.
+        """
+        self._require_backend_idle()
+        if not items:
+            raise ValueError("backend input must contain at least one message")
+        events: list[types.ResponseItemCreateEvent] = []
+        # Validate the entire batch before queuing any item, including unsupported modalities.
+        for item in items:
+            if item.get("type", "message") != "message" or item.get("role") not in (
+                "user",
+                "developer",
+                "system",
+                "assistant",
+            ):
+                raise ValueError(
+                    "backend input accepts messages only; tool outputs use the tool loop"
+                )
+            content = item.get("content")
+            if not isinstance(content, str):
+                if not isinstance(content, list) or not content:
+                    raise ValueError("backend messages require text or image content")
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") not in (
+                        "input_text",
+                        "input_image",
+                    ):
+                        raise ValueError("backend messages support input_text and input_image only")
+                    if part["type"] == "input_text":
+                        if not isinstance(part.get("text"), str):
+                            raise ValueError("input_text requires text")
+                    else:
+                        image_url, file_id = part.get("image_url"), part.get("file_id")
+                        if bool(image_url) == bool(file_id):
+                            raise ValueError(
+                                "input_image requires exactly one image_url or file_id"
+                            )
+                        if file_id is not None and (
+                            not isinstance(file_id, str) or not file_id.strip()
+                        ):
+                            raise ValueError("input_image file_id must be nonempty")
+                        if image_url is not None:
+                            if not isinstance(image_url, str):
+                                raise ValueError(
+                                    "input_image image_url must be a URL or image data URI"
+                                )
+                            parsed = urlparse(image_url)
+                            if parsed.scheme in ("http", "https") and parsed.netloc:
+                                pass
+                            elif image_url.startswith("data:image/") and ";base64," in image_url:
+                                try:
+                                    if not base64.b64decode(
+                                        image_url.split(",", 1)[1], validate=True
+                                    ):
+                                        raise ValueError("empty image data")
+                                except ValueError:
+                                    raise ValueError(
+                                        "input_image data URI requires base64 image data"
+                                    ) from None
+                            else:
+                                raise ValueError(
+                                    "input_image image_url must be a URL or image data URI"
+                                )
+            events.append(
+                types.ResponseItemCreateEvent.model_validate(
+                    {
+                        "event_id": utils.shortuuid("backend_input_"),
+                        "item": item,
+                    }
+                )
+            )
+        return tuple(self._queue_tracked(event) for event in events)
+
+    def run_backend(self, *, input_message_id: str | None = None) -> GPTLiveCommandReceipt:
+        """Request one backend run. Transport success is not provider acceptance or playback."""
+        self._require_backend_idle()
+        self._backend_input_message_id = input_message_id
+        receipt = self._queue_tracked(
+            types.ResponseCreateEvent(event_id=utils.shortuuid("backend_run_"))
+        )
+        self._backend_run_pending = True
+        return receipt
+
+    def _invalidate_commands(self) -> None:
+        for receipt in self._command_receipts.values():
+            if receipt.status in ("queued", "sent"):
+                receipt.status = "connection_lost"
+        self._command_receipts.clear()
 
     def _build_delegation(self) -> types.Delegation:
         if self._opts.delegation == "client":
@@ -392,7 +609,7 @@ class GPTLiveSession(
                 try:
                     ws_conn = await self._create_ws_conn()
                     if reconnecting:
-                        self._reset_for_reconnect()
+                        await self._reset_for_reconnect()
                         self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
                     try:
                         await self._run_ws(ws_conn)
@@ -426,11 +643,24 @@ class GPTLiveSession(
                     raise error from None
                 reconnecting = True
         finally:
+            await self._close_input_vad()
+            self._invalidate_commands()
             self._audio_ch.close()
 
-    def _reset_for_reconnect(self) -> None:
+    async def _reset_for_reconnect(self) -> None:
         # a new connection is a new session, reseeded from the history; the rest of what the
         # dropped one was carrying never arrives
+        await self._close_input_vad()
+        self._invalidate_commands()
+        # Drain the old connection's commands, including tool results and commentary.
+        # Replaying an uncertain send into a fresh session can duplicate paid work.
+        while not self._msg_ch.empty():
+            self._msg_ch.recv_nowait()
+        self._connection_epoch += 1
+        self._backend_run_pending = False
+        self._backend_poisoned = False
+        self._startup_audio_duration = 0.0
+        self._last_microphone_at = self._input_audio_until = asyncio.get_running_loop().time()
         self._bstream.clear()
         self._input_resampler = None
         self._session_started_fut = asyncio.Future()
@@ -438,7 +668,11 @@ class GPTLiveSession(
         self._end_speech("user")
         self._speech.clear()
         self._delegated_responses.clear()
+        self._backend_input_message_id = None
+        self._last_final_input_id = None
+        self._delegation_input_ids.clear()
         self._fnc_call_to_delegation.clear()
+        self._dispatched_call_ids.clear()
         self._usage_total = types.Usage()
         self._session_id = None
 
@@ -497,6 +731,10 @@ class GPTLiveSession(
             start = self._session_start_event()
             self._session_start_sent = True
             await self._ws_send(ws_conn, start)
+            if self._connection_epoch > 0 and self._input_muted:
+                # Restore the application's desired mute state before new-connection audio.
+                await self._session_started_fut
+                await self._ws_send(ws_conn, types.InputAudioMuteEvent())
 
             async for msg in self._msg_ch:
                 # the protocol asks for session.started before any audio or command goes out
@@ -541,7 +779,11 @@ class GPTLiveSession(
                     )
 
         send_task = asyncio.create_task(_send_task(), name="_send_task")
-        tasks = [asyncio.create_task(_recv_task(), name="_recv_task"), send_task]
+        tasks = [
+            asyncio.create_task(_recv_task(), name="_recv_task"),
+            send_task,
+            asyncio.create_task(self._input_clock_task(), name="GPTLiveSession._input_clock"),
+        ]
         wait_reconnect_task: asyncio.Task | None = None
         if self._opts.max_session_duration is not None:
             wait_reconnect_task = asyncio.create_task(
@@ -564,11 +806,19 @@ class GPTLiveSession(
         self, ws_conn: aiohttp.ClientWebSocketResponse, event: types.ClientEvent | dict[str, Any]
     ) -> None:
         raw = event if isinstance(event, dict) else event.model_dump(exclude_none=True)
+        if raw.get("type") == "response.create" and self._backend_poisoned:
+            if (receipt := self._command_receipts.get(raw.get("event_id", ""))) is not None:
+                receipt.status = "error"
+                receipt.error_code = "backend_context_failed"
+            return
         self.emit("openai_client_event_queued", raw)
         if lk_oai_debug and raw.get("type") != "session.input_audio.append":
             logger.debug("gpt-live client event", extra={"lk.pii.event": raw})
         try:
             await ws_conn.send_str(json.dumps(raw))
+            if (receipt := self._command_receipts.get(raw.get("event_id", ""))) is not None:
+                if receipt.status == "queued":
+                    receipt.status = "sent"
         except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError):
             raise APIConnectionError("GPT-Live send failed") from None
 
@@ -578,6 +828,12 @@ class GPTLiveSession(
         etype = event.get("type", "")
         if lk_oai_debug and etype != "session.output_audio.delta":
             logger.debug("gpt-live server event", extra={"lk.pii.event": event})
+
+        if etype in ("session.usage.updated", "session.closed"):
+            usage = event.get("usage")
+            if not isinstance(usage, dict) or not _valid_usage_seconds(usage.get("seconds", 0)):
+                # Preserve the lifecycle event and caller's payload; reject just invalid usage.
+                event = {**event, "usage": {"seconds": 0.0}}
 
         if etype == "session.started":
             self._handle_session_started(types.SessionStartedEvent.construct(**event))
@@ -607,6 +863,11 @@ class GPTLiveSession(
             "session.thinking.appended",
             "session.commentary.appended",
         ):
+            if (
+                receipt := self._command_receipts.get(event.get("client_event_id", ""))
+            ) is not None:
+                if receipt.status in ("queued", "sent") and etype == receipt.event_type + "ed":
+                    receipt.status = "acknowledged"
             # Context append receipts arrive at the estimated injection end, not speech end.
             # Nothing waits on these acknowledgments.
             logger.debug(
@@ -617,6 +878,11 @@ class GPTLiveSession(
             logger.debug("unhandled gpt-live event", extra={"lk.pii.type": etype})
 
     def _handle_session_started(self, event: types.SessionStartedEvent) -> None:
+        if not self._session_started_fut.done():
+            now = asyncio.get_running_loop().time()
+            self._last_microphone_at = now
+            self._input_audio_until = now + self._startup_audio_duration
+            self._startup_audio_duration = 0.0
         self._session_id = event.session.id or self._session_id
         self._num_retries = 0
         if not self._session_started_fut.done():
@@ -663,6 +929,8 @@ class GPTLiveSession(
                 self.emit("input_speech_started", llm.InputSpeechStartedEvent())
         speech.text += event.delta
         speech.quiet_ms = 0
+        if role == "user":
+            speech.input_audio_ms = self._input_audio_ms
         if event.end_ms is not None:
             speech.end_ms = max(speech.end_ms or 0, event.end_ms)
         if isinstance(message := self._history.get_by_id(speech.message_id), llm.ChatMessage):
@@ -691,6 +959,7 @@ class GPTLiveSession(
         """Close a speaker's message; for the user this is the end of their turn."""
         if (speech := self._speech.pop(role, None)) is None or role != "user":
             return
+        self._last_final_input_id = speech.message_id
         # the final transcript goes out first, so nothing waits for one after the stop
         self.emit(
             "input_audio_transcription_completed",
@@ -709,12 +978,29 @@ class GPTLiveSession(
         delegation = event.delegation
         if not delegation.id:
             logger.warning("gpt-live delegation has no id; nothing can answer it")
+        elif delegation.target == "responses":
+            speech = self._speech.get("user")
+            self._delegated_responses.setdefault(
+                delegation.id,
+                _DelegatedResponse(
+                    input_message_id=(
+                        self._backend_input_message_id
+                        if self._backend_run_pending
+                        else speech.message_id
+                        if speech
+                        else self._last_final_input_id
+                    )
+                ),
+            )
         elif delegation.target == "client":
             speech = self._speech.get("user")
             self.emit(
                 "delegation_created",
                 GPTLiveDelegation(
-                    id=delegation.id, pending_transcript=speech.text if speech else ""
+                    id=delegation.id,
+                    pending_transcript=speech.text if speech else "",
+                    pending_message_id=speech.message_id if speech else None,
+                    pending_message_created_at=speech.started_at if speech else None,
                 ),
             )
 
@@ -727,12 +1013,36 @@ class GPTLiveSession(
         d_id = envelope.delegation_id
 
         if event.type == "response.created":
-            self._delegated_responses[d_id] = _DelegatedResponse()
+            previous = self._delegated_responses.get(d_id)
+            response_id = response.id if response else None
+            if (
+                previous is not None
+                and response_id is not None
+                and previous.response_id == response_id
+            ):
+                return  # duplicate creation must not reset a completed response's result barrier
+            self._backend_run_pending = False
+            created = _DelegatedResponse(
+                response_id=response_id,
+                input_message_id=(
+                    previous.input_message_id
+                    if previous
+                    else self._delegation_input_ids.get(
+                        d_id, self._backend_input_message_id if d_id is None else None
+                    )
+                ),
+            )
+            if previous is not None:
+                # Replacing a response does not answer its outstanding calls on the backend.
+                created.call_ids.update(previous.call_ids - previous.returned)
+                for call_id in previous.returned:
+                    self._fnc_call_to_delegation.pop(call_id, None)
+            self._delegated_responses[d_id] = created
 
         elif event.type == "response.output_item.done":
             # only the completed item carries the name, call id and arguments together
             item = event.item
-            if item is None or item.type != "function_call":
+            if item is None or item.type != "function_call" or item.status != "completed":
                 return
             if not item.call_id or not item.name or item.arguments is None:
                 logger.warning(
@@ -740,12 +1050,15 @@ class GPTLiveSession(
                     extra={"call_id": item.call_id, "name": item.name},
                 )
                 return
+            if item.call_id in self._dispatched_call_ids:
+                return
             if (pending := self._delegated_responses.get(d_id)) is None:
                 logger.warning(
                     "gpt-live function call outside a known response",
                     extra={"call_id": item.call_id, "delegation_id": d_id},
                 )
-                pending = self._delegated_responses[d_id] = _DelegatedResponse(completed=True)
+                pending = self._delegated_responses[d_id] = _DelegatedResponse()
+            self._dispatched_call_ids.add(item.call_id)
             pending.call_ids.add(item.call_id)
             self._fnc_call_to_delegation[item.call_id] = d_id
 
@@ -754,6 +1067,7 @@ class GPTLiveSession(
                 call_id=item.call_id,
                 name=item.name,
                 arguments=item.arguments,
+                extra={"gpt_live": {"input_message_id": pending.input_message_id}},
             )
             self._history.insert(fnc_call)
             self.emit("function_call", fnc_call)
@@ -786,6 +1100,12 @@ class GPTLiveSession(
                     ),
                 )
             if (pending := self._delegated_responses.get(d_id)) is not None:
+                if (
+                    response is not None
+                    and response.id is not None
+                    and pending.response_id not in (None, response.id)
+                ):
+                    return  # a late terminal event cannot complete its replacement response
                 pending.completed = True
                 self._maybe_continue_response(d_id)
 
@@ -799,21 +1119,44 @@ class GPTLiveSession(
                     "lk.pii.incomplete_details": response.incomplete_details if response else None,
                 },
             )
-            if (pending := self._delegated_responses.pop(d_id, None)) is not None:
+            pending = self._delegated_responses.get(d_id)
+            if pending is not None:
+                if (
+                    response is not None
+                    and response.id is not None
+                    and pending.response_id not in (None, response.id)
+                ):
+                    return
+                del self._delegated_responses[d_id]
                 for call_id in pending.call_ids:
                     self._fnc_call_to_delegation.pop(call_id, None)
+                self._maybe_continue_response(d_id)
 
     def _maybe_continue_response(self, delegation_id: str | None) -> None:
         # response.create runs the continuation, and only once the response has finished asking
         # and every call it made has its answer; a partial batch is rejected
-        pending = self._delegated_responses.get(delegation_id)
-        if pending is None or not pending.completed or not pending.call_ids <= pending.returned:
+        if self._backend_poisoned or self._backend_run_pending:
             return
-        del self._delegated_responses[delegation_id]
-        if not pending.call_ids:
+        if not self._delegated_responses:
             return
-        for call_id in pending.call_ids:
+        # response.create has no delegation_id: no pending batch may be partial.
+        if any(
+            not pending.completed or not pending.call_ids <= pending.returned
+            for pending in self._delegated_responses.values()
+        ):
+            return
+        call_ids = set().union(*(p.call_ids for p in self._delegated_responses.values()))
+        for key, pending in self._delegated_responses.items():
+            if pending.call_ids:
+                self._delegation_input_ids[key] = pending.input_message_id
+            else:
+                self._delegation_input_ids.pop(key, None)
+        self._delegated_responses.clear()
+        if not call_ids:
+            return
+        for call_id in call_ids:
             self._fnc_call_to_delegation.pop(call_id, None)
+        self._backend_run_pending = True
         self.send_event(types.ResponseCreateEvent(event_id=utils.shortuuid("response_create_")))
 
     # metrics and errors
@@ -831,12 +1174,16 @@ class GPTLiveSession(
             "gpt-live session closed",
             extra={"reason": event.reason, "session_id": self._session_id},
         )
-        self._handle_usage(event.usage)
-        if not self._session_closed_fut.done():
-            self._session_closed_fut.set_result(None)
+        try:
+            self._handle_usage(event.usage)
+        finally:
+            if not self._session_closed_fut.done():
+                self._session_closed_fut.set_result(None)
 
     def _handle_usage(self, usage: types.Usage) -> None:
         # reported cumulatively for the whole session, so only the delta goes to the collectors
+        if not _valid_usage_seconds(usage.seconds) or usage.seconds <= self._usage_total.seconds:
+            return
         previous, self._usage_total = self._usage_total, usage
         self.emit(
             "metrics_collected",
@@ -861,6 +1208,13 @@ class GPTLiveSession(
         )
 
     def _handle_error(self, error: types.ErrorBody) -> None:
+        if (receipt := self._command_receipts.get(error.client_event_id or "")) is not None:
+            receipt.status = "error"
+            receipt.error_code = error.code or error.type
+            if receipt.event_id.startswith(("backend_input_", "backend_run_")):
+                self._backend_poisoned = True
+        if (error.client_event_id or "").startswith(("tool_output_", "response_create_")):
+            self._backend_poisoned = True
         logger.error(
             "gpt-live returned an error",
             extra={"lk.pii.error": error.model_dump(exclude_none=True)},
@@ -901,14 +1255,15 @@ class GPTLiveSession(
         return self._tools.copy()
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
-        # the caller's turn ends on their own audio: this much pushed since their last fragment
-        if (speech := self._speech.get("user")) is not None:
-            speech.quiet_ms += round(frame.duration * 1000)
-            if speech.quiet_ms >= _MIN_SILENCE_MS:
-                self._end_speech("user")
-
+        if self._closing or self._msg_ch.closed or self._main_atask.done() or self._input_resetting:
+            return
+        now = asyncio.get_running_loop().time()
+        self._last_microphone_at = now
+        # Account for duration, not just arrival time, so a burst of microphone frames is
+        # not followed by extra clock padding while its audio is still ahead of wall time.
+        self._input_audio_until = max(now, self._input_audio_until) + frame.duration
         if self._input_resampler and frame.sample_rate != self._input_resampler._input_rate:
-            self._input_resampler = None
+            self._flush_input_audio()
         if self._input_resampler is None and (
             frame.sample_rate != SAMPLE_RATE or frame.num_channels != NUM_CHANNELS
         ):
@@ -917,26 +1272,119 @@ class GPTLiveSession(
             )
         frames = self._input_resampler.push(frame) if self._input_resampler else [frame]
         for f in frames:
-            for nf in self._bstream.write(f.data.tobytes()):
-                self.send_event(
-                    types.InputAudioAppendEvent(audio=base64.b64encode(nf.data).decode("utf-8"))
-                )
+            self._process_input_audio(f)
 
-    def append_instructions(self, text: str, *, delegation_id: str | None = None) -> None:
+    async def _input_clock_task(self) -> None:
+        """Keep Live's input clock moving when no microphone supplies audio.
+
+        This task belongs to one WebSocket attempt; it never outlives that connection and
+        never pads before startup, during close/reconnect, or ahead of queued microphone time.
+        """
+        await self._session_started_fut
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(_INPUT_CLOCK_FRAME_S)
+            if self._closing or self._session_closed_fut.done():
+                continue
+            now = loop.time()
+            if now - self._last_microphone_at < _INPUT_IDLE_S or now < self._input_audio_until:
+                continue
+            self._flush_input_audio()
+            self._process_input_audio(
+                rtc.AudioFrame.create(SAMPLE_RATE, NUM_CHANNELS, SAMPLE_RATE // 10)
+            )
+            self._input_audio_until = now + _INPUT_CLOCK_FRAME_S
+
+    def _process_input_audio(self, frame: rtc.AudioFrame) -> None:
+        if self._input_resetting or self._closing or self._main_atask.done():
+            return
+        if not self._session_started_fut.done():
+            self._startup_audio_duration += frame.duration
+        if self._input_vad is None:
+            self._input_vad = inference.VAD(
+                activation_threshold=_INPUT_SPEECH_THRESHOLD,
+                deactivation_threshold=_INPUT_SPEECH_CONTINUATION_THRESHOLD,
+            ).stream()
+            self._input_vad_task = asyncio.create_task(
+                self._detect_input_speech(self._input_vad), name="GPTLiveSession._input_vad"
+            )
+        self._input_audio_ms += frame.duration * 1000
+        self._input_vad.push_frame(
+            rtc.AudioFrame.create(frame.sample_rate, frame.num_channels, frame.samples_per_channel)
+            if self._input_muted
+            else frame
+        )
+        for normalized in self._bstream.write(frame.data.tobytes()):
+            self._queue_input_audio(normalized)
+
+    def _queue_input_audio(self, frame: rtc.AudioFrame) -> None:
+        self.send_event(types.InputAudioAppendEvent(audio=base64.b64encode(frame.data).decode()))
+
+    def _flush_input_audio(self) -> None:
+        if self._input_resetting:
+            return  # pending audio belongs to the retiring detector and will be discarded
+        if self._input_resampler is not None:
+            for frame in self._input_resampler.flush():
+                self._process_input_audio(frame)
+            self._input_resampler = None
+        for frame in self._bstream.flush():
+            self._queue_input_audio(frame)
+
+    @utils.log_exceptions(logger=logger)
+    async def _detect_input_speech(self, stream: vad.VADStream) -> None:
+        async for event in stream:
+            if event.type != vad.VADEventType.INFERENCE_DONE:
+                continue
+            previous_ms = self._input_vad_ms
+            self._input_vad_ms += sum(frame.duration for frame in event.frames) * 1000
+            threshold = (
+                _INPUT_SPEECH_CONTINUATION_THRESHOLD
+                if self._input_speaking
+                else _INPUT_SPEECH_THRESHOLD
+            )
+            self._input_speaking = event.probability >= threshold
+            if self._closing or (speech := self._speech.get("user")) is None:
+                continue
+            duration_ms = max(0.0, self._input_vad_ms - max(previous_ms, speech.input_audio_ms))
+            if not duration_ms:
+                continue
+            speech.quiet_ms = 0 if self._input_speaking else speech.quiet_ms + duration_ms
+            if speech.quiet_ms >= _MIN_SILENCE_MS - 1e-6:
+                self._end_speech("user")
+
+    async def _close_input_vad(self) -> None:
+        self._input_resetting = True
+        stream, self._input_vad = self._input_vad, None
+        task, self._input_vad_task = self._input_vad_task, None
+        if task is not None:
+            await utils.aio.cancel_and_wait(task)
+        if stream is not None:
+            await stream.aclose()
+        self._input_audio_ms = self._input_vad_ms = 0.0
+        self._input_speaking = False
+        self._input_resetting = False
+
+    def append_instructions(
+        self, text: str, *, delegation_id: str | None = None
+    ) -> GPTLiveCommandReceipt:
         """Add a standing rule to the model's instructions, capped at 500 tokens."""
-        self._append(types.InstructionsAppendEvent, text, delegation_id)
+        return self._append(types.InstructionsAppendEvent, text, delegation_id)
 
-    def append_thinking(self, text: str, *, delegation_id: str | None = None) -> None:
+    def append_thinking(
+        self, text: str, *, delegation_id: str | None = None
+    ) -> GPTLiveCommandReceipt:
         """Give the model something to know without saying it, capped at 500 tokens."""
-        self._append(types.ThinkingAppendEvent, text, delegation_id)
+        return self._append(types.ThinkingAppendEvent, text, delegation_id)
 
-    def append_commentary(self, text: str, *, delegation_id: str | None = None) -> None:
+    def append_commentary(
+        self, text: str, *, delegation_id: str | None = None
+    ) -> GPTLiveCommandReceipt:
         """Give the model something to say once, in its own words, capped at 500 tokens.
 
         Under client delegation this answers a :class:`GPTLiveDelegation`; repeated calls with the
         same ``delegation_id`` continue that work.
         """
-        self._append(types.CommentaryAppendEvent, text, delegation_id)
+        return self._append(types.CommentaryAppendEvent, text, delegation_id)
 
     def _append(
         self,
@@ -945,8 +1393,8 @@ class GPTLiveSession(
         | type[types.CommentaryAppendEvent],
         text: str,
         delegation_id: str | None,
-    ) -> None:
-        self.send_event(
+    ) -> GPTLiveCommandReceipt:
+        return self._queue_tracked(
             event_cls(
                 event_id=utils.shortuuid("append_"), delegation_id=delegation_id, content=text
             )
@@ -994,6 +1442,14 @@ class GPTLiveSession(
         )
 
     async def _append_items(self, items: list[llm.ChatItem]) -> None:
+        for item in items:
+            if isinstance(item, llm.ChatMessage) and any(
+                isinstance(part, llm.ImageContent) for part in item.content
+            ):
+                raise llm.RealtimeError(
+                    "gpt-live frontend ChatContext does not accept images; use "
+                    "queue_backend_input for Responses delegation or your client vision backend"
+                )
         self._history.insert(items)
         if not self._session_start_sent:
             return  # startup history, rendered into session.start

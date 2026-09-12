@@ -563,12 +563,12 @@ async def test_a_fragment_is_attached_when_the_audio_reaches_it(duplex) -> None:
     )
 
 
-async def test_transcript_no_audio_ever_claims_is_emitted_rather_than_lost(duplex, caplog) -> None:
-    """Losing transcript is worse than an odd chat item; the model's silence is the clock."""
+async def test_transcript_without_matching_audio_is_not_published(duplex, caplog) -> None:
+    """Text-only fallback would claim words were spoken when no audio carried them."""
     fake, session, generations = duplex
     fake.push(0.001, count=20)
     await _settle()
-    with caplog.at_level(logging.ERROR, logger="livekit.agents"):
+    with caplog.at_level(logging.WARNING, logger="livekit.agents"):
         fake.say("Lost words.", start_ms=2000, end_ms=2400)
         fake.push(0.001, count=29)
         await _settle()
@@ -576,11 +576,11 @@ async def test_transcript_no_audio_ever_claims_is_emitted_rather_than_lost(duple
         fake.push(0.001, count=1)
         await _settle()
 
-    assert [r.message for r in caplog.records if r.levelno >= logging.ERROR] == [
-        "duplex transcript outlived the audio it describes"
+    assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == [
+        "duplex transcript omitted"
     ]
-    assert len(generations) == 1
-    assert (await asyncio.wait_for(_read(generations[0]), timeout=1)) == (0, "Lost words.")
+    assert generations == []
+    assert session.chat_ctx.items == []
     assert not session._fragments
 
 
@@ -691,6 +691,7 @@ async def test_the_adapter_keeps_the_context_under_the_ids_the_framework_uses(du
     fake.push(0.001, count=8)
     await _settle()
 
+    await asyncio.wait_for(_read(generations[0]), timeout=1)
     items = session.chat_ctx.items
     assert [type(i).__name__ for i in items] == ["ChatMessage", "ChatMessage", "FunctionCall"]
     user, assistant, recorded_call = items
@@ -805,9 +806,11 @@ def _askable() -> tuple[_FakeDuplexSession, _DuplexRealtimeSession]:
 
 async def test_generate_reply_reaches_a_model_that_supports_it() -> None:
     fake, session = _askable()
-    session.generate_reply(instructions="say hi")
+    reply = session.generate_reply(instructions="say hi")
     assert fake.replies_requested == ["say hi"]
     await session.aclose()
+    with pytest.raises(llm.RealtimeError, match="closed"):
+        await reply
 
 
 async def test_a_requested_reply_is_the_speech_that_follows_it() -> None:
@@ -934,3 +937,278 @@ async def test_a_failed_audio_stream_reports_an_unrecoverable_error(duplex) -> N
     assert [e.recoverable for e in errors] == [False]
     assert isinstance(errors[0].error, _Boom)
     assert errors[0].label == fake.duplex_model.label
+
+
+@pytest.mark.parametrize("close_before_text", [False, True])
+async def test_delayed_transcript_stays_with_original_stamped_audio(close_before_text) -> None:
+    session = llm.DuplexRealtimeAdapter(_FakeDuplexModel(), gate=lambda: FixedGate(0.001)).session()
+    assert isinstance(session, _DuplexRealtimeSession)
+    generations = []
+    session.on("generation_created", generations.append)
+    try:
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=0))
+        first_id = session._burst.id
+        if close_before_text:
+            session._close_burst()
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("First utterance.", start_ms=0, end_ms=100)
+        )
+        if not close_before_text:
+            session._close_burst()
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=1000))
+        assert session._burst.transcript == ""
+        first = session.chat_ctx.get_by_id(first_id)
+        assert first is not None and first.text_content == "First utterance."
+        assert (await asyncio.wait_for(_read(generations[0]), 1)) == (1, "First utterance.")
+    finally:
+        await session.aclose()
+
+
+async def test_finalized_transcript_cannot_reappear_in_next_burst() -> None:
+    session = llm.DuplexRealtimeAdapter(_FakeDuplexModel(), gate=lambda: FixedGate(0.001)).session()
+    assert isinstance(session, _DuplexRealtimeSession)
+    try:
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=0))
+        first_id = session._burst.id
+        session._close_burst()
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=1000))
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Old words.", start_ms=0, end_ms=100)
+        )
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=1100))
+        assert session._burst.transcript == ""
+        assert session.chat_ctx.get_by_id(first_id) is None
+    finally:
+        await session.aclose()
+
+
+@pytest.mark.parametrize("close_before_text", [False, True])
+async def test_unstamped_delayed_text_never_moves_to_new_burst(close_before_text, caplog) -> None:
+    session = llm.DuplexRealtimeAdapter(_FakeDuplexModel(), gate=lambda: FixedGate(0.001)).session()
+    assert isinstance(session, _DuplexRealtimeSession)
+    try:
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3)))
+        first_id = session._burst.id
+        if close_before_text:
+            session._close_burst()
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("First utterance.", start_ms=0, end_ms=100)
+        )
+        if not close_before_text:
+            session._close_burst()
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3)))
+        assert session._burst.transcript == ""
+        first = session.chat_ctx.get_by_id(first_id)
+        if close_before_text:
+            assert first is None
+            assert any(
+                getattr(r, "reason", None) == "ambiguous_closed_audio" for r in caplog.records
+            )
+        else:
+            assert first is not None and first.text_content == "First utterance."
+    finally:
+        await session.aclose()
+
+
+async def test_known_unstamped_anchor_accepts_late_text_during_grace() -> None:
+    session = llm.DuplexRealtimeAdapter(_FakeDuplexModel(), gate=lambda: FixedGate(0.001)).session()
+    assert isinstance(session, _DuplexRealtimeSession)
+    generations = []
+    session.on("generation_created", generations.append)
+    try:
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=None))
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("First", start_ms=9000, end_ms=9050)
+        )
+        first_id = session._burst.id
+        session._close_burst()
+        assert session._pending_burst is not None
+        assert not session._pending_burst.audio_ch.closed
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta(" utterance.", start_ms=9050, end_ms=9100)
+        )
+        assert (await asyncio.wait_for(_read(generations[0]), 1)) == (1, "First utterance.")
+        assert session.chat_ctx.get_by_id(first_id).text_content == "First utterance."
+        assert session._finalize_timer is None
+    finally:
+        await session.aclose()
+
+
+async def test_interrupt_finalizes_grace_and_rejects_late_text() -> None:
+    session = llm.DuplexRealtimeAdapter(_FakeDuplexModel(), gate=lambda: FixedGate(0.001)).session()
+    assert isinstance(session, _DuplexRealtimeSession)
+    try:
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=0))
+        first_id = session._burst.id
+        session._close_burst()
+        session.interrupt()
+        assert session._pending_burst is None and session._finalize_timer is None
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Unplayed words.", start_ms=0, end_ms=100)
+        )
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=1000))
+        assert session._burst.transcript == ""
+        assert session.chat_ctx.get_by_id(first_id) is None
+    finally:
+        await session.aclose()
+
+
+async def test_unanchored_backchannel_reports_ambiguity_until_stamped_audio(caplog) -> None:
+    session = llm.DuplexRealtimeAdapter(_FakeDuplexModel(), gate=lambda: FixedGate(0.001)).session()
+    assert isinstance(session, _DuplexRealtimeSession)
+    try:
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3)))
+        session._close_burst()
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3)))
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Ambiguous", start_ms=0, end_ms=100)
+        )
+        assert session._burst.transcript == ""
+        assert any(
+            getattr(r, "reason", None) == "ambiguous_unstamped_audio" for r in caplog.records
+        )
+        session._close_burst()
+        session._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=1000))
+        session._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Identified", start_ms=1000, end_ms=1100)
+        )
+        assert session._burst.transcript == "Identified"
+    finally:
+        await session.aclose()
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_late_text_keeps_playout_segment_and_frontend_message(interrupted) -> None:
+    from livekit.agents.voice import Agent, AgentSession
+    from livekit.agents.voice.transcription.synchronizer import TranscriptSynchronizer
+
+    from .fake_io import FakeAudioOutput, FakeTextOutput
+
+    model = _FakeDuplexModel()
+    frontend = AgentSession(llm=llm.DuplexRealtimeAdapter(model, gate=lambda: FixedGate(0.001)))
+    captions = FakeTextOutput()
+    sync = TranscriptSynchronizer(
+        next_in_chain_audio=FakeAudioOutput(), next_in_chain_text=captions
+    )
+    frontend.output.audio = sync.audio_output
+    frontend.output.transcription = sync.text_output
+    messages = []
+    frontend.on("conversation_item_added", lambda ev: messages.append(ev.item))
+    try:
+        await frontend.start(Agent(instructions="Wait."))
+        adapter = frontend._activity._rt_session
+        assert isinstance(adapter, _DuplexRealtimeSession)
+        adapter._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=0))
+        first_id = adapter._burst.id
+        await _settle()
+        adapter._close_burst()
+        # The 100 ms audio has played, but grace keeps its synchronizer segment open.
+        await asyncio.sleep(0.12)
+        if interrupted:
+            await frontend.interrupt(force=True)
+        adapter._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("First utterance.", start_ms=0, end_ms=100)
+        )
+        await asyncio.wait_for(frontend.wait_for_idle(), 2)
+        adapter._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=1000))
+        second_id = adapter._burst.id
+        adapter._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Second utterance.", start_ms=1000, end_ms=1100)
+        )
+        adapter._close_burst()
+        await _settle()
+        await asyncio.wait_for(frontend.wait_for_idle(), 2)
+        spoken = {
+            item.id: item.text_content
+            for item in messages
+            if isinstance(item, llm.ChatMessage) and item.role == "assistant"
+        }
+        if interrupted:
+            assert first_id not in spoken
+            assert not any("First utterance." in text for text in captions._messages)
+        else:
+            assert spoken[first_id] == "First utterance."
+            assert "First utterance." in captions._messages
+        assert spoken[second_id] == "Second utterance."
+        assert "Second utterance." in captions._messages
+        assert "First utterance.Second utterance." not in captions._messages
+    finally:
+        await frontend.aclose()
+        await sync.aclose()
+
+
+async def test_idle_audio_timeout_still_allows_late_transcript() -> None:
+    model = _FakeDuplexModel()
+    session = llm.DuplexRealtimeAdapter(
+        model, gate=lambda: FixedGate(0.001), audio_timeout=0.02
+    ).session()
+    assert isinstance(session, _DuplexRealtimeSession)
+    generations = []
+    session.on("generation_created", generations.append)
+    try:
+        model.session_obj.push(0.3, start_ms=0)
+        await _settle()
+        first_id = session._burst.id
+        await asyncio.sleep(0.15)
+        assert session._burst is None and session._pending_burst is not None
+        model.session_obj.say("Late words.", start_ms=0, end_ms=100)
+        assert (await asyncio.wait_for(_read(generations[0]), 1)) == (1, "Late words.")
+        assert session.chat_ctx.get_by_id(first_id).text_content == "Late words."
+    finally:
+        await session.aclose()
+    assert session._finalize_timer is None and session._pending_burst is None
+
+
+@pytest.mark.parametrize("future_arrived", [False, True])
+async def test_partial_playout_persists_only_completed_spans(future_arrived) -> None:
+    from livekit.agents.voice import Agent, AgentSession
+    from livekit.agents.voice.transcription.synchronizer import TranscriptSynchronizer
+
+    from .fake_io import FakeAudioOutput, FakeTextOutput
+
+    model = _FakeDuplexModel()
+    frontend = AgentSession(llm=llm.DuplexRealtimeAdapter(model, gate=lambda: FixedGate(0.001)))
+    captions = FakeTextOutput()
+    sync = TranscriptSynchronizer(
+        next_in_chain_audio=FakeAudioOutput(), next_in_chain_text=captions
+    )
+    frontend.output.audio = sync.audio_output
+    frontend.output.transcription = sync.text_output
+    messages = []
+    frontend.on("conversation_item_added", lambda ev: messages.append(ev.item))
+    try:
+        await frontend.start(Agent(instructions="Wait."))
+        adapter = frontend._activity._rt_session
+        assert isinstance(adapter, _DuplexRealtimeSession)
+        adapter._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3, duration_ms=500), start_ms=0))
+        first_id = adapter._burst.id
+        adapter._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Heard.", start_ms=0, end_ms=100)
+        )
+        if future_arrived:
+            adapter._on_transcript_delta(
+                llm.DuplexOutputTranscriptDelta("Unplayed.", start_ms=400, end_ms=500)
+            )
+        adapter._close_burst()
+        await asyncio.sleep(0.15)
+        await frontend.interrupt(force=True)
+        adapter._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Unplayed.", start_ms=400, end_ms=500)
+        )
+        adapter._on_audio_frame(llm.DuplexAudioFrame(_frame(0.3), start_ms=1000))
+        adapter._on_transcript_delta(
+            llm.DuplexOutputTranscriptDelta("Next.", start_ms=1000, end_ms=1100)
+        )
+        adapter._close_burst()
+        await _settle()
+        await asyncio.wait_for(frontend.wait_for_idle(), 2)
+        spoken = [item for item in messages if isinstance(item, llm.ChatMessage)]
+        first = [item for item in spoken if item.id == first_id]
+        assert len(first) == 1
+        assert first[0].interrupted and first[0].text_content == "Heard."
+        assert "Heard." in captions._messages
+        assert all("Unplayed." not in (item.text_content or "") for item in spoken)
+        assert all("Unplayed." not in text for text in captions._messages)
+    finally:
+        await frontend.aclose()
+        await sync.aclose()

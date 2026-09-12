@@ -39,9 +39,12 @@ from .utils import compute_chat_ctx_diff
 # a floor this low is digital silence; it keeps the gate's ratios finite when a model emits zeros
 _SILENCE_FLOOR = 1e-4
 
-# transcript is text the model says it spoke; when no sound ever opens a burst for it, this much
-# audio later it is emitted as a text-only generation rather than lost. audio is never held for it
+# Unclaimed words cannot become a spoken chat item without matching audio.
 _UNCLAIMED_TRANSCRIPT_MS = 3000
+
+# Already forwarded audio plays immediately. Its generation stays open briefly for late text,
+# including the audio channel, so the transcription synchronizer does not rotate prematurely.
+_TRANSCRIPT_GRACE_S = 0.3
 
 # how long a requested reply waits for the model to start speaking before it counts as declined
 _REPLY_TIMEOUT = 10.0
@@ -197,6 +200,7 @@ class _Burst:
     and the oldest unclaimed fragment describe the same moment."""
     opened_at: float = field(default_factory=time.time)
     transcript: str = ""
+    audio_end_ms: int = 0
     _last_annotation: float = 0.0
 
     def attach(self, fragment: DuplexOutputTranscriptDelta) -> None:
@@ -307,6 +311,10 @@ class _DuplexRealtimeSession(RealtimeSession):
         self._duplex = duplex
         self._gate = gate
         self._burst: _Burst | None = None
+        self._pending_burst: _Burst | None = None
+        self._finalize_timer: asyncio.TimerHandle | None = None
+        self._finalized_span_end: int | None = None
+        self._unanchored_audio = False
         self._audio_timeout = audio_timeout
         # the adapter's clock: output audio heard so far, which arrives at playback pace
         self._audio_ms = 0
@@ -371,6 +379,7 @@ class _DuplexRealtimeSession(RealtimeSession):
             if idle_timeout is not None:
                 idle_timeout.cancel()
             self._close_burst()
+            self._finalize_burst()
 
     def _on_audio_frame(self, f: DuplexAudioFrame) -> None:
         if f.start_ms is not None:
@@ -378,21 +387,12 @@ class _DuplexRealtimeSession(RealtimeSession):
         # the gate is the one boundary: a burst is open exactly while the model is audibly
         # producing output, its own pauses inside an utterance included
         if self._gate.update(f.frame):
-            burst = self._burst or self._open_burst()
+            burst = self._burst or self._open_burst(stamped=f.start_ms is not None)
             if not burst.audio_ch.closed:
                 burst.audio_ch.send_nowait(f.frame)
             self._audio_ms += round(f.frame.duration * 1000)
-
-            # the first fragment anchors the span clock to the audio clock; a later one is due when
-            # the audio reaches its span, and one this burst never reaches waits for the next
-            while self._fragments:
-                fragment = self._fragments[0]
-                if fragment.start_ms is not None:
-                    if burst.anchor_ms is None:
-                        burst.anchor_ms = fragment.start_ms - burst.audio_start_ms
-                    if fragment.start_ms - burst.anchor_ms > self._audio_ms + _ATTACH_LEAD_MS:
-                        break
-                burst.attach(self._fragments.popleft())
+            burst.audio_end_ms = self._audio_ms
+            self._attach_ready_fragments()
             return
 
         self._audio_ms += round(f.frame.duration * 1000)
@@ -401,16 +401,11 @@ class _DuplexRealtimeSession(RealtimeSession):
         elif (
             self._fragments and self._audio_ms - self._waiting_since_ms >= _UNCLAIMED_TRANSCRIPT_MS
         ):
-            logger.error(
-                "duplex transcript outlived the audio it describes",
-                extra={"lk.pii.transcript": "".join(f.text for f in self._fragments)},
-            )
-            burst = self._open_burst()
-            while self._fragments:
-                burst.attach(self._fragments.popleft())
-            self._close_burst()
+            self._drop_transcript("no_matching_audio")
+            self._fragments.clear()
 
-    def _open_burst(self, *, message: bool = True) -> _Burst:
+    def _open_burst(self, *, message: bool = True, stamped: bool = False) -> _Burst:
+        self._finalize_burst()
         burst = self._burst = _Burst(
             id=shortuuid("item_"),
             message_ch=aio.Chan(),
@@ -418,6 +413,8 @@ class _DuplexRealtimeSession(RealtimeSession):
             text_ch=aio.Chan(),
             audio_ch=aio.Chan(),
             audio_start_ms=self._audio_ms,
+            audio_end_ms=self._audio_ms,
+            anchor_ms=0 if stamped else None,
         )
         ev = GenerationCreatedEvent(
             message_stream=burst.message_ch,
@@ -445,11 +442,33 @@ class _DuplexRealtimeSession(RealtimeSession):
         return burst
 
     def _close_burst(self) -> None:
+        self._attach_ready_fragments()
         burst, self._burst = self._burst, None
         # the gate never stays open past the burst it opened, so the next one opens on sound again
         self._gate.deactivate()
         if burst is not None:
+            self._finalize_burst()
+            self._pending_burst = burst
+            if burst.audio_end_ms == burst.audio_start_ms:
+                self._finalize_burst()
+            else:
+                self._finalize_timer = asyncio.get_running_loop().call_later(
+                    _TRANSCRIPT_GRACE_S, self._finalize_burst
+                )
+        self._waiting_since_ms = self._audio_ms
+
+    def _finalize_burst(self) -> None:
+        if self._finalize_timer is not None:
+            self._finalize_timer.cancel()
+            self._finalize_timer = None
+        burst, self._pending_burst = self._pending_burst, None
+        if burst is not None:
             burst.close()
+            if burst.audio_end_ms > burst.audio_start_ms:
+                if burst.anchor_ms is None:
+                    self._unanchored_audio = True
+                else:
+                    self._finalized_span_end = burst.audio_end_ms + burst.anchor_ms
             if burst.transcript:
                 # under the id and time the framework will use for it, so a context update matches
                 self._chat_ctx.insert(
@@ -460,13 +479,63 @@ class _DuplexRealtimeSession(RealtimeSession):
                         created_at=burst.opened_at,
                     )
                 )
-        self._waiting_since_ms = self._audio_ms
+
+    def _drop_transcript(self, reason: str) -> None:
+        logger.warning("duplex transcript omitted", extra={"reason": reason})
+
+    def _attach_ready_fragments(self) -> None:
+        burst = self._burst
+        if burst is None:
+            return
+        while self._fragments:
+            fragment = self._fragments[0]
+            if fragment.start_ms is None and (
+                self._finalized_span_end is not None or self._unanchored_audio
+            ):
+                self._fragments.popleft()
+                self._drop_transcript("ambiguous_missing_timestamp")
+                continue
+            if (
+                fragment.start_ms is not None
+                and self._finalized_span_end is not None
+                and fragment.start_ms < self._finalized_span_end
+            ):
+                self._fragments.popleft()
+                self._drop_transcript("finalized_audio")
+                continue
+            if burst.anchor_ms is None and self._unanchored_audio:
+                self._fragments.popleft()
+                self._drop_transcript("ambiguous_unstamped_audio")
+                continue
+            if fragment.start_ms is not None:
+                if burst.anchor_ms is None:
+                    burst.anchor_ms = fragment.start_ms - burst.audio_start_ms
+                if fragment.start_ms - burst.anchor_ms > burst.audio_end_ms + _ATTACH_LEAD_MS:
+                    break
+                if fragment.start_ms - burst.anchor_ms < burst.audio_start_ms:
+                    self._fragments.popleft()
+                    self._drop_transcript("before_current_audio")
+                    continue
+            burst.attach(self._fragments.popleft())
 
     def _on_transcript_delta(self, ev: DuplexOutputTranscriptDelta) -> None:
-        # attached on the next frame, since the sound is what places the words
+        pending = self._pending_burst
+        if pending is not None:
+            if ev.start_ms is None or ev.end_ms is None or pending.anchor_ms is None:
+                self._drop_transcript("ambiguous_closed_audio")
+                return
+            start = ev.start_ms - pending.anchor_ms
+            end = ev.end_ms - pending.anchor_ms
+            if pending.audio_start_ms <= start < pending.audio_end_ms:
+                if start <= end <= pending.audio_end_ms:
+                    pending.attach(ev)
+                else:
+                    self._drop_transcript("beyond_closed_audio")
+                return
         if not self._fragments:
             self._waiting_since_ms = self._audio_ms
         self._fragments.append(ev)
+        self._attach_ready_fragments()
 
     def _on_input_transcription(self, ev: InputTranscriptionCompleted) -> None:
         if ev.is_final:
@@ -498,6 +567,10 @@ class _DuplexRealtimeSession(RealtimeSession):
         # describe, or the reply it was asked for
         self._fragments.clear()
         self._close_burst()
+        self._finalize_burst()
+        self._finalized_span_end = None
+        self._unanchored_audio = False
+        self._audio_ms = 0
         self._fail_pending_reply("the session reconnected before the model replied")
         self.emit("session_reconnected", ev)
 
@@ -611,7 +684,11 @@ class _DuplexRealtimeSession(RealtimeSession):
         pass
 
     def interrupt(self) -> None:
-        pass  # barge-in is the model's own, and it cannot be cancelled
+        # The provider cannot be cancelled, but an interrupted generation must never receive
+        # late text after the framework has already reconciled what was played.
+        self._fragments.clear()
+        self._close_burst()
+        self._finalize_burst()
 
     def truncate(
         self,
@@ -631,6 +708,7 @@ class _DuplexRealtimeSession(RealtimeSession):
     async def aclose(self) -> None:
         await aio.cancel_and_wait(self._segment_atask)
         self._close_burst()
+        self._finalize_burst()
         self._fail_pending_reply("the session closed before the model replied")
         with contextlib.suppress(Exception):
             await self._duplex.aclose()

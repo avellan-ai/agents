@@ -105,10 +105,8 @@ def test_convert_expr_cartesia() -> None:
         '<expr type="expression" label="excited"/> We won! '
         '<expr type="break" label="1s"/> <expr type="sound" label="laugh"/> Unbelievable.'
     )
-    # expression -> <emotion>, break stays, sound is dropped (no Cartesia support) —
-    # without leaving the space it sat between behind as a doubled separator
     assert convert_markup("cartesia", text) == (
-        '<emotion value="excited"/> We won! <break time="1s"/> Unbelievable.'
+        '<emotion value="excited"/> We won! <break time="1s"/> [laughter] Unbelievable.'
     )
 
 
@@ -322,8 +320,9 @@ def test_llm_instructions_cartesia_types() -> None:
     assert '<expr type="spell">' in instructions
     # coarse self-closing prosody point controls
     assert '<expr type="prosody" label="slow"/>' in instructions
-    # no non-verbal sounds
-    assert 'type="sound"' not in instructions
+    assert '<expr type="sound" label="laugh"/>' in instructions
+    assert "joking/comedic" not in instructions
+    assert "EVERY sentence" not in instructions
 
 
 def test_llm_instructions_inworld_kinds() -> None:
@@ -414,3 +413,73 @@ def test_to_dict_strip_markup_is_expr_only_and_assistant_only() -> None:
     # default keeps the raw content for persistence
     items = chat_ctx.to_dict()["items"]
     assert items[1]["content"] == [MIXED]
+
+
+@pytest.mark.parametrize("closing", ["/>", "/ >"])
+def test_cartesia_point_control_before_spell(closing: str) -> None:
+    text = '<expr type="prosody" label="slow"' + closing + ' Code <expr type="spell">A7X9</expr>.'
+    assert convert_markup("cartesia", text) == ('<speed ratio="0.85"/> Code <spell>A7X9</spell>.')
+    assert strip_all_markup(text) == " Code A7X9."
+
+
+def test_self_closing_prosody_before_wrapping_prosody() -> None:
+    text = (
+        '<expr type="prosody" label="slow"/> Now '
+        '<expr type="prosody" label="whisper">a secret</expr>.'
+    )
+    assert convert_markup("xai", text) == " Now <whisper>a secret</whisper>."
+
+
+@pytest.mark.parametrize("sound", ["sigh", "gasp", "cough"])
+def test_cartesia_unsupported_sounds_are_removed(sound: str) -> None:
+    text = f'Hello <expr type="sound" label="{sound}"/> there.'
+    assert convert_markup("cartesia", text) == "Hello there."
+
+
+@pytest.mark.parametrize("nonverbals", [False, {"laughing": False}])
+def test_cartesia_laughter_steering(nonverbals) -> None:
+    instructions = llm_instructions("cartesia", {"nonverbal_sounds": nonverbals})
+    assert instructions is not None
+    assert 'type="sound"' not in instructions
+    assert "laughter" not in instructions
+    assert '<expr type="spell">' in instructions
+
+
+def test_cartesia_laughter_transcript_and_alignment() -> None:
+    from livekit.agents.tts._provider_format import drop_bracket_cues
+    from livekit.agents.types import TimedString
+
+    text = 'Good one. <expr type="sound" label="laugh"/> Your turn.'
+    assert strip_all_markup(text) == "Good one. Your turn."
+    assert strip_all_markup("Keep [this] literal.") == "Keep [this] literal."
+    held = []
+    first = drop_bracket_cues(
+        [
+            TimedString("Good one. ", start_time=0, end_time=1),
+            TimedString("[laugh", start_time=1, end_time=2),
+        ],
+        held,
+    )
+    second = drop_bracket_cues(
+        [
+            TimedString("ter] ", start_time=2, end_time=3),
+            TimedString("Your turn.", start_time=3, end_time=4),
+        ],
+        held,
+    )
+    assert "".join(first + second) == "Good one. Your turn."
+    assert second[-1].start_time == 3
+    assert second[-1].end_time == 4
+    assert not held
+
+
+@pytest.mark.asyncio
+async def test_cartesia_laughter_survives_markdown_filter() -> None:
+    from livekit.agents.voice.transcription.filters import filter_markdown
+
+    async def chunks():
+        for chunk in ['**Good one.** <expr type="sound" ', 'label="laugh"/> Your turn.']:
+            yield chunk
+
+    filtered = "".join([chunk async for chunk in filter_markdown(chunks())])
+    assert convert_markup("cartesia", filtered) == "Good one. [laughter] Your turn."

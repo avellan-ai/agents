@@ -1,4 +1,5 @@
 from .gpt_live_model import (
+    GPTLiveCommandReceipt,
     GPTLiveDelegation,
     GPTLiveModel,
     GPTLiveSession,
@@ -15,6 +16,7 @@ __all__ = [
     "GPTLiveModel",
     "GPTLiveSession",
     "GPTLiveDelegation",
+    "GPTLiveCommandReceipt",
     "GPTLiveVoices",
     "ResponsesDelegationOptions",
 ]

@@ -25,6 +25,9 @@ STANDARD_SPEECH_RATE = 3.83  # hyphens (syllables) per second
 # cancelling them, so a stalled downstream output can't deadlock segment rotation
 _SEGMENT_ACLOSE_TIMEOUT = 5.0
 
+# Summing frame durations can put an exact annotation endpoint a few ulps past playout.
+_PLAYOUT_TIME_EPSILON = 1e-9
+
 
 @dataclass
 class _TextSyncOptions:
@@ -130,6 +133,8 @@ class _TextData:
     done: bool = False
     forwarded_hyphens: int = 0
     forwarded_text: str = ""
+    spans: list[tuple[int, float | None, float | None]] = field(default_factory=list)
+    """Raw text end offsets and audio bounds; an unknown end cannot prove playout."""
 
 
 class _SegmentSynchronizerImpl:
@@ -170,6 +175,7 @@ class _SegmentSynchronizerImpl:
 
         self._playback_completed = False
         self._interrupted = False
+        self._interrupted_transcript: str | None = None
 
     @property
     def id(self) -> str:
@@ -249,6 +255,7 @@ class _SegmentSynchronizerImpl:
 
         self._text_data.word_stream.push_text(text)
         self._text_data.pushed_text += text
+        self._text_data.spans.append((len(self._text_data.pushed_text), start_time, end_time))
 
         if end_time is not None:
             # a closed span releases the trailing word instead of waiting for the next delimiter
@@ -329,6 +336,25 @@ class _SegmentSynchronizerImpl:
             return
 
         self._interrupted = interrupted
+        if interrupted and self._interrupted_transcript is None:
+            if self._audio_data.annotated_rate is None:
+                self._interrupted_transcript = self._text_data.forwarded_text
+            else:
+                # Captions can lead playback and their pacing task can lag it. Only complete
+                # annotated spans certify the played prefix, independent of caption delivery.
+                position = min(playback_position, self._audio_data.pushed_duration)
+                played_prefix = 0
+                previous_end = 0.0
+                for offset, start_time, end_time in self._text_data.spans:
+                    if (
+                        end_time is None
+                        or not previous_end <= end_time <= position + _PLAYOUT_TIME_EPSILON
+                        or (start_time is not None and not 0 <= start_time <= end_time)
+                    ):
+                        break
+                    played_prefix = offset
+                    previous_end = end_time
+                self._interrupted_transcript = self._text_data.pushed_text[:played_prefix]
         if not self._text_data.done or not self._audio_data.done:
             logger.warning(
                 "_SegmentSynchronizerImpl.playback_finished called before text/audio input is done",
@@ -347,6 +373,8 @@ class _SegmentSynchronizerImpl:
 
     @property
     def synchronized_transcript(self) -> str:
+        if self._interrupted_transcript is not None:
+            return self._interrupted_transcript
         if self._playback_completed:
             return self._text_data.pushed_text
 
@@ -430,6 +458,8 @@ class _SegmentSynchronizerImpl:
                 delay = 0
 
             await self._sleep_if_not_closed(delay / 2.0)
+            if self._interrupted or (self.closed and not self._playback_completed):
+                return
             self._out_ch.send_nowait(
                 TimedString(word, end_time=time.time() - self._start_wall_time)
             )
