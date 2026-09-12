@@ -13,6 +13,28 @@ from .test_gpt_live_model import _completed, _connect_hook, _function_call_done,
 pytestmark = pytest.mark.unit
 
 
+async def test_closed_output_channel_does_not_mark_tool_returned(monkeypatch):
+    _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="test")
+    session = model.session()
+    try:
+        await session._update_session()
+        await session.wait_started()
+        session._handle_event(_response_event("d", {"type": "response.created"}))
+        session._handle_event(_response_event("d", _function_call_done("a")))
+        pending = session._delegated_responses["d"]
+        session._msg_ch.close()
+        with pytest.raises(llm.RealtimeError, match="closed"):
+            await session._append_items(
+                [llm.FunctionCallOutput(call_id="a", output="saved", is_error=False)]
+            )
+        assert "a" not in pending.returned
+        assert not any(item.type == "function_call_output" for item in session._history.items)
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
 @pytest.mark.parametrize("status", [None, "incomplete", "in_progress", "failed"])
 async def test_only_completed_function_items_dispatch_once(monkeypatch, status):
     ws = _connect_hook(monkeypatch)
