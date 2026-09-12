@@ -1580,6 +1580,7 @@ class GPTLiveSession(
         )
 
     async def _append_items(self, items: list[llm.ChatItem]) -> None:
+        self._require_open()
         for item in items:
             if isinstance(item, llm.ChatMessage) and any(
                 isinstance(part, llm.ImageContent) for part in item.content
@@ -1620,7 +1621,7 @@ class GPTLiveSession(
                 extra={"functions": silenced},
             )
         for output, delegation_id in backend_outputs:
-            self.send_event(
+            self._queue_tracked(
                 types.ResponseItemCreateEvent(
                     event_id=utils.shortuuid("tool_output_"),
                     item=FunctionCallOutput(
