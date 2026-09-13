@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import math
 import os
 import sys
 import time
@@ -188,6 +189,7 @@ class _LiveOptions:
     base_url: str
     conn_options: APIConnectOptions
     max_session_duration: float | None
+    input_transcription: Literal["native", "external"]
 
 
 class GPTLiveModel(llm.DuplexModel):
@@ -205,6 +207,7 @@ class GPTLiveModel(llm.DuplexModel):
         http_session: aiohttp.ClientSession | None = None,
         max_session_duration: NotGivenOr[float | None] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+        input_transcription: Literal["native", "external"] = "native",
     ) -> None:
         """
         Args:
@@ -222,6 +225,10 @@ class GPTLiveModel(llm.DuplexModel):
             http_session: Optional shared HTTP session.
             max_session_duration: Seconds before the connection is recycled.
             conn_options: Retry/backoff and connection settings.
+            input_transcription: Local transcript source. ``external`` requires the application
+                to supply onset and finalized STT through this session's input transcription
+                methods. Native transcript deltas remain raw telemetry only; audio and model
+                turn-taking continue normally. This option is never sent to the provider.
         """
         super().__init__(
             capabilities=llm.DuplexCapabilities(
@@ -241,7 +248,10 @@ class GPTLiveModel(llm.DuplexModel):
                 "to the client or by setting the OPENAI_API_KEY environment variable"
             )
 
+        if input_transcription not in ("native", "external"):
+            raise ValueError("input_transcription must be native or external")
         self._opts = _LiveOptions(
+            input_transcription=input_transcription,
             model=model,
             voice=voice,
             delegation=delegation,
@@ -318,6 +328,7 @@ class GPTLiveSession(
         self._input_audio_ms = 0.0
         self._input_vad_ms = 0.0
         self._input_speaking = False
+        self._external_input_ids: set[str] = set()
         self._input_resetting = False
         self._input_muted = False
         self._last_microphone_at = 0.0
@@ -352,6 +363,8 @@ class GPTLiveSession(
         # Keep dispatched ids beyond continuation/failure so duplicate delivery cannot run an
         # already completed (possibly state-changing) tool again on this connection.
         self._dispatched_call_ids: set[str] = set()
+        self._retired_input_delegations: set[str | None] = set()
+        self._retired_input_calls: set[str] = set()
 
         # the newest history item the last ask was about, so an ask never repeats one
         self._asked_item_id: str | None = None
@@ -513,6 +526,8 @@ class GPTLiveSession(
     def run_backend(self, *, input_message_id: str | None = None) -> GPTLiveCommandReceipt:
         """Request one backend run. Transport success is not provider acceptance or playback."""
         self._require_backend_idle()
+        if None in self._retired_input_delegations:
+            raise llm.RealtimeError("aborted unscoped backend input requires a new connection")
         self._backend_input_message_id = input_message_id
         receipt = self._queue_tracked(
             types.ResponseCreateEvent(event_id=utils.shortuuid("backend_run_"))
@@ -665,7 +680,11 @@ class GPTLiveSession(
         self._input_resampler = None
         self._session_started_fut = asyncio.Future()
         self._session_closed_fut = asyncio.Future()
-        self._end_speech("user")
+        if self._opts.input_transcription == "external":
+            if speech := self._speech.pop("user", None):
+                self._history.remove(speech.message_id)
+        else:
+            self._end_speech("user")
         self._speech.clear()
         self._delegated_responses.clear()
         self._backend_input_message_id = None
@@ -673,6 +692,8 @@ class GPTLiveSession(
         self._delegation_input_ids.clear()
         self._fnc_call_to_delegation.clear()
         self._dispatched_call_ids.clear()
+        self._retired_input_delegations.clear()
+        self._retired_input_calls.clear()
         self._usage_total = types.Usage()
         self._session_id = None
 
@@ -902,6 +923,8 @@ class GPTLiveSession(
             self._audio_ch.send_nowait(llm.DuplexAudioFrame(frame=frame))
 
     def _handle_transcript_delta(self, role: Role, event: types.TranscriptDeltaEvent) -> None:
+        if role == "user" and self._opts.input_transcription == "external":
+            return
         if not event.delta:
             return
         speech = self._speech.get(role)
@@ -955,6 +978,125 @@ class GPTLiveSession(
                 ),
             )
 
+    @property
+    def input_transcription(self) -> Literal["native", "external"]:
+        """The local source of user transcript authority for this session."""
+        return self._opts.input_transcription
+
+    def _require_external_input(self, connection_epoch: int) -> None:
+        self._require_open()
+        if self._opts.input_transcription != "external":
+            raise llm.RealtimeError("external input transcription is not enabled")
+        if connection_epoch != self._connection_epoch:
+            raise llm.RealtimeError("input transcription belongs to a retired connection")
+
+    def begin_input_transcription(
+        self, *, item_id: str, turn_started_at: float, connection_epoch: int
+    ) -> None:
+        """Bind an externally observed speech onset before managed work can delegate.
+
+        Capture ``connection_epoch`` on this session when starting the STT turn. The caller
+        owns the message identity and onset time; neither changes when final text arrives.
+        An existing or retired identity cannot be reused. No provider event is sent.
+        """
+        self._require_external_input(connection_epoch)
+        if not item_id or not math.isfinite(turn_started_at):
+            raise ValueError("input transcription requires an id and finite onset time")
+        if "user" in self._speech:
+            raise llm.RealtimeError("an external input transcription is already active")
+        if item_id in self._external_input_ids or self._history.get_by_id(item_id) is not None:
+            raise llm.RealtimeError("input transcription identity has already been used")
+        self._external_input_ids.add(item_id)
+        self._last_final_input_id = None
+        self._speech["user"] = _Speech(message_id=item_id, started_at=turn_started_at)
+        self._history.insert(
+            llm.ChatMessage(
+                id=item_id,
+                role="user",
+                content=[""],
+                transcript_confidence=1.0,
+                created_at=turn_started_at,
+            )
+        )
+        self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+
+    def update_input_transcription(
+        self,
+        *,
+        item_id: str,
+        transcript: str,
+        is_final: bool,
+        connection_epoch: int,
+    ) -> None:
+        """Replace cumulative STT text and optionally finalize this same message once.
+
+        ``is_final`` must come from the external STT source, never from local silence or
+        native GPT-Live fragments. STT finality does not establish semantic commitment.
+        If transcription fails, abort the input instead of finalizing its partial text.
+        """
+        self._require_external_input(connection_epoch)
+        speech = self._speech.get("user")
+        if speech is None or speech.message_id != item_id:
+            raise llm.RealtimeError("input transcription is not active")
+        if is_final and not transcript.strip():
+            raise ValueError("empty final transcription must be aborted")
+        speech.text = transcript
+        if isinstance(message := self._history.get_by_id(item_id), llm.ChatMessage):
+            message.content = [transcript]
+        if is_final:
+            self._end_speech("user")
+        else:
+            self.emit(
+                "input_audio_transcription_completed",
+                llm.InputTranscriptionCompleted(
+                    item_id=item_id,
+                    transcript=transcript,
+                    is_final=False,
+                    turn_started_at=speech.started_at,
+                ),
+            )
+
+    def abort_input_transcription(self, *, item_id: str, connection_epoch: int) -> None:
+        """Retire failed STT input without making its partial text an executable turn."""
+        self._require_external_input(connection_epoch)
+        speech = self._speech.get("user")
+        if speech is None or speech.message_id != item_id:
+            raise llm.RealtimeError("input transcription is not active")
+        self._speech.pop("user")
+        self._history.remove(item_id)
+        retired = {
+            key
+            for key, pending in self._delegated_responses.items()
+            if pending.input_message_id == item_id
+        } | {key for key, value in self._delegation_input_ids.items() if value == item_id}
+        if self._backend_input_message_id == item_id:
+            retired.add(None)
+        self._retired_input_delegations.update(retired)
+        for key in retired:
+            self._delegated_responses.pop(key, None)
+            self._delegation_input_ids.pop(key, None)
+        for call_id, key in list(self._fnc_call_to_delegation.items()):
+            if key in retired:
+                self._retired_input_calls.add(call_id)
+                del self._fnc_call_to_delegation[call_id]
+        self._retired_input_calls.update(
+            item.call_id
+            for item in self._history.items
+            if isinstance(item, llm.FunctionCall)
+            and item.extra.get("gpt_live", {}).get("input_message_id") == item_id
+        )
+        self._history.items[:] = [
+            item
+            for item in self._history.items
+            if not (
+                isinstance(item, (llm.FunctionCall, llm.FunctionCallOutput))
+                and item.call_id in self._retired_input_calls
+            )
+        ]
+        self.emit(
+            "input_speech_stopped", llm.InputSpeechStoppedEvent(user_transcription_enabled=False)
+        )
+
     def _end_speech(self, role: Role) -> None:
         """Close a speaker's message; for the user this is the end of their turn."""
         if (speech := self._speech.pop(role, None)) is None or role != "user":
@@ -976,6 +1118,8 @@ class GPTLiveSession(
 
     def _handle_delegation_created(self, event: types.SessionDelegationCreatedEvent) -> None:
         delegation = event.delegation
+        if delegation.id in self._retired_input_delegations:
+            return
         if not delegation.id:
             logger.warning("gpt-live delegation has no id; nothing can answer it")
         elif delegation.target == "responses":
@@ -1011,6 +1155,11 @@ class GPTLiveSession(
         event = envelope.event
         response = event.response
         d_id = envelope.delegation_id
+        if d_id in self._retired_input_delegations:
+            # Drain usage, but never resurrect an aborted input through a late creation,
+            # call or continuation. There is no provider-side per-delegation cancel event.
+            if event.type != "response.completed":
+                return
 
         if event.type == "response.created":
             previous = self._delegated_responses.get(d_id)
@@ -1300,7 +1449,7 @@ class GPTLiveSession(
             return
         if not self._session_started_fut.done():
             self._startup_audio_duration += frame.duration
-        if self._input_vad is None:
+        if self._input_vad is None and self._opts.input_transcription == "native":
             self._input_vad = inference.VAD(
                 activation_threshold=_INPUT_SPEECH_THRESHOLD,
                 deactivation_threshold=_INPUT_SPEECH_CONTINUATION_THRESHOLD,
@@ -1309,11 +1458,14 @@ class GPTLiveSession(
                 self._detect_input_speech(self._input_vad), name="GPTLiveSession._input_vad"
             )
         self._input_audio_ms += frame.duration * 1000
-        self._input_vad.push_frame(
-            rtc.AudioFrame.create(frame.sample_rate, frame.num_channels, frame.samples_per_channel)
-            if self._input_muted
-            else frame
-        )
+        if self._input_vad is not None:
+            self._input_vad.push_frame(
+                rtc.AudioFrame.create(
+                    frame.sample_rate, frame.num_channels, frame.samples_per_channel
+                )
+                if self._input_muted
+                else frame
+            )
         for normalized in self._bstream.write(frame.data.tobytes()):
             self._queue_input_audio(normalized)
 
@@ -1443,6 +1595,14 @@ class GPTLiveSession(
 
     async def _append_items(self, items: list[llm.ChatItem]) -> None:
         self._require_open()
+        items = [
+            item
+            for item in items
+            if not (
+                isinstance(item, (llm.FunctionCall, llm.FunctionCallOutput))
+                and item.call_id in self._retired_input_calls
+            )
+        ]
         for item in items:
             if isinstance(item, llm.ChatMessage) and any(
                 isinstance(part, llm.ImageContent) for part in item.content
