@@ -880,6 +880,24 @@ async def test_same_canonical_image_with_new_local_cache_id_does_not_restart(
             session._active_session = None
 
 
+async def test_response_instructions_are_not_fabricated_model_speech(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(monkeypatch, model="gemini-3.8-live") as session:
+        events: list[Any] = []
+        session._send_client_event = events.append  # type: ignore[method-assign]
+        pending = session.generate_reply(instructions="Answer the latest player briefly.")
+        try:
+            content = next(event for event in events if isinstance(event, types.LiveClientContent))
+            assert content.turn_complete is True
+            assert content.turns and content.turns[0].role == "user"
+            assert "not dialogue" in content.turns[0].parts[0].text
+            assert "Answer the latest player briefly." in content.turns[0].parts[0].text
+            assert list(session.chat_ctx.messages()) == []
+        finally:
+            pending.cancel()
+
+
 async def test_unheard_google_reply_is_not_restored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

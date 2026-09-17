@@ -1006,7 +1006,19 @@ class RealtimeSession(llm.RealtimeSession):
 
         turns = []
         if is_given(instructions):
-            turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
+            # Response guidance is application input, not an assistant utterance
+            # to prefill or transcribe as spoken dialogue.
+            turns.append(
+                types.Content(
+                    parts=[
+                        types.Part(
+                            text="Application response instructions (not dialogue):\n"
+                            + instructions
+                        )
+                    ],
+                    role="user",
+                )
+            )
         if _needs_reply_placeholder(self._opts.model):
             turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
         self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
