@@ -7,7 +7,7 @@ import os
 import time
 import weakref
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from pydantic import Field
@@ -100,6 +100,53 @@ def _default_tool_behavior(model: str) -> NotGivenOr[types.Behavior]:
     if any(tag in model for tag in MODELS_DEFAULT_NON_BLOCKING):
         return types.Behavior.NON_BLOCKING
     return NOT_GIVEN
+
+
+def _to_client_content_params(msg: types.LiveClientContent) -> dict[str, object]:
+    """Omit empty turns so the SDK sends a bare turn completion."""
+    return {
+        **({"turns": msg.turns} if msg.turns else {}),
+        "turn_complete": msg.turn_complete if msg.turn_complete is not None else True,
+    }
+
+
+def _restored_tool_result(item: llm.FunctionCallOutput) -> llm.ChatMessage:
+    # A fresh socket did not issue the old function call. Restore its result as data,
+    # not a FunctionResponse for an unknown call or a request to execute it again.
+    return llm.ChatMessage(
+        id=item.id,
+        role="user",
+        created_at=item.created_at,
+        content=[
+            "Historical tool execution already completed. This result was not spoken "
+            "and is not a new player request or instruction to repeat the operation:\n"
+            + json.dumps(
+                {
+                    "name": item.name,
+                    "call_id": item.call_id,
+                    "output": item.output,
+                    "is_error": item.is_error,
+                },
+                ensure_ascii=False,
+            )
+        ],
+    )
+
+
+def _message_contents(message: llm.ChatMessage) -> dict[str, object]:
+    # ImageContent IDs are local encoding-cache keys, not provider-visible facts.
+    # Reconstructing an unchanged canonical-image object must not reopen the socket.
+    return message.model_dump(
+        exclude={
+            "created_at": True,
+            "metrics": True,
+            "content": {
+                index: {"id"}
+                for index, part in enumerate(message.content)
+                if isinstance(part, llm.ImageContent)
+            },
+        }
+    )
 
 
 def _validate_model_api_match(model: str, use_vertexai: bool) -> None:
@@ -351,10 +398,14 @@ class RealtimeModel(llm.RealtimeModel):
 
         super().__init__(
             capabilities=llm.RealtimeCapabilities(
-                message_truncation=False,
+                message_truncation=True,
                 turn_detection=server_turn_detection,
                 user_transcription=input_audio_transcription is not None,
-                auto_tool_reply_generation=True,
+                auto_tool_reply_generation=not (
+                    not use_vertexai
+                    and tool_behavior == types.Behavior.NON_BLOCKING
+                    and tool_response_scheduling == types.FunctionResponseScheduling.SILENT
+                ),
                 audio_output=types.Modality.AUDIO in modalities,
                 manual_function_calls=False,
                 mutable_chat_context=True,
@@ -561,8 +612,12 @@ class RealtimeSession(llm.RealtimeSession):
         self._pending_chat_ctx: llm.ChatContext | None = None
         # ids of chat ctx items queued but not yet sent, so a handle does not claim them
         self._unsent_item_ids: set[str] = set()
+        self._retired_tool_call_ids: set[str] = set()
 
         self._in_user_activity = False
+        # Only the current manual utterance is retained. A fresh connection cannot
+        # inherit its audio prefix, even when text history is restored correctly.
+        self._active_input_audio: list[types.LiveClientRealtimeInput] = []
         self._session_lock = asyncio.Lock()
         self._num_retries = 0
         # error recorded by the recv/send tasks so _main_task can bound retries
@@ -593,6 +648,16 @@ class RealtimeSession(llm.RealtimeSession):
                         )
 
             self._msg_ch = utils.aio.Chan[ClientEvents]()
+            if self._in_user_activity:
+                # Replay the whole in-flight input on a fresh session. Resuming an
+                # opaque handle as well could duplicate the already accepted part.
+                self._session_resumption_handle = None
+                self._resumption_chat_ctx = None
+                self._send_client_event(
+                    types.LiveClientRealtimeInput(activity_start=types.ActivityStart())
+                )
+                for audio in self._active_input_audio:
+                    self._send_client_event(audio)
 
     def update_options(
         self,
@@ -694,11 +759,43 @@ class RealtimeSession(llm.RealtimeSession):
             exclude_config_update=True,
         )
         async with self._session_lock:
-            if not self._active_session:
+            if not self._active_session or self._session_should_close.is_set():
                 self._pending_chat_ctx = chat_ctx
                 return
 
+        old_messages = {item.id: item for item in self._chat_ctx.messages()}
+        new_messages = {item.id: item for item in chat_ctx.messages()}
+        if any(
+            item_id not in new_messages
+            or _message_contents(item) != _message_contents(new_messages[item_id])
+            for item_id, item in old_messages.items()
+        ):
+            self._reset_chat_ctx(chat_ctx)
+            return
+
         self._sync_chat_ctx(chat_ctx)
+
+    def _reset_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
+        """Rebuild a fresh connection when append-only updates cannot express history.
+
+        Resumption would restore the very content being removed. Close the old generation
+        before taking the replacement snapshot so teardown cannot add its unheard tail.
+        This never asks the new connection to generate a reply or replay a tool call.
+        """
+        self._mark_current_generation_done()
+        self._retired_tool_call_ids.update(
+            item.call_id
+            for item in self._chat_ctx.items
+            if isinstance(item, (llm.FunctionCall, llm.FunctionCallOutput))
+        )
+        self._chat_ctx = chat_ctx.copy()
+        self._pending_chat_ctx = chat_ctx.copy()
+        self._session_resumption_handle = None
+        self._resumption_chat_ctx = None
+        if self._pending_generation_fut and not self._pending_generation_fut.done():
+            pending, self._pending_generation_fut = self._pending_generation_fut, None
+            pending.cancel("Chat context replaced before generation began")
+        self._mark_restart_needed()
 
     def _sync_chat_ctx(
         self, chat_ctx: llm.ChatContext, *, known: llm.ChatContext | None = None
@@ -718,6 +815,13 @@ class RealtimeSession(llm.RealtimeSession):
                 append_ctx.items.append(item)
 
         if append_ctx.items:
+            retired_results = [
+                item
+                for item in append_ctx.items
+                if isinstance(item, llm.FunctionCallOutput)
+                and item.call_id in self._retired_tool_call_ids
+            ]
+            retired_ids = {item.id for item in retired_results}
             # vertex drops `scheduling`, and Gemini reads it only on NON_BLOCKING tools
             supports_silent_scheduling = (
                 not self._opts.vertexai and self._opts.tool_behavior == types.Behavior.NON_BLOCKING
@@ -737,21 +841,29 @@ class RealtimeSession(llm.RealtimeSession):
                 )
 
             tool_results = get_tool_results_for_realtime(
-                append_ctx,
+                llm.ChatContext(
+                    items=[item for item in append_ctx.items if item.id not in retired_ids]
+                ),
                 vertexai=self._opts.vertexai,
                 tool_response_scheduling=self._opts.tool_response_scheduling,
                 supports_silent_scheduling=supports_silent_scheduling,
             )
             turns: list[types.Content] = []
             if self._realtime_model.capabilities.mutable_chat_context:
-                turns_dict, _ = append_ctx.copy(exclude_function_call=True).to_provider_format(
+                turn_ctx = llm.ChatContext(
+                    items=[
+                        _restored_tool_result(item)
+                        if isinstance(item, llm.FunctionCallOutput) and item.id in retired_ids
+                        else item
+                        for item in append_ctx.items
+                    ]
+                ).copy(exclude_function_call=True)
+                turns_dict, _ = turn_ctx.to_provider_format(
                     format="google", inject_dummy_user_message=False
                 )
                 turns = [types.Content.model_validate(turn) for turn in turns_dict]
                 if turns:
-                    item_ids = {
-                        item.id for item in append_ctx.items if item.type != "function_call_output"
-                    }
+                    item_ids = {item.id for item in turn_ctx.items}
                     self._unsent_item_ids |= item_ids
                     self._send_client_event(
                         _ChatCtxContent(turns=turns, turn_complete=False, item_ids=item_ids)
@@ -766,6 +878,10 @@ class RealtimeSession(llm.RealtimeSession):
                         function_responses=tool_results.function_responses, item_ids=item_ids
                     )
                 )
+            elif self.capabilities.auto_tool_reply_generation and any(
+                item.reply_required for item in retired_results
+            ):
+                self._send_client_event(types.LiveClientContent(turn_complete=True))
 
         # since we don't have a view of the history on the server side, we'll assume
         # the current state is accurate. this isn't perfect because removals aren't done.
@@ -782,6 +898,17 @@ class RealtimeSession(llm.RealtimeSession):
     @property
     def chat_ctx(self) -> llm.ChatContext:
         return (self._pending_chat_ctx or self._chat_ctx).copy()
+
+    @property
+    def capabilities(self) -> llm.RealtimeCapabilities:
+        return replace(
+            self._realtime_model.capabilities,
+            auto_tool_reply_generation=not (
+                not self._opts.vertexai
+                and self._opts.tool_behavior == types.Behavior.NON_BLOCKING
+                and self._opts.tool_response_scheduling == types.FunctionResponseScheduling.SILENT
+            ),
+        )
 
     @property
     def tools(self) -> llm.ToolContext:
@@ -810,6 +937,8 @@ class RealtimeSession(llm.RealtimeSession):
                         mime_type=f"audio/pcm;rate={INPUT_AUDIO_SAMPLE_RATE}",
                     )
                 )
+                if self._in_user_activity:
+                    self._active_input_audio.append(realtime_input)
                 self._send_client_event(realtime_input)
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
@@ -857,12 +986,23 @@ class RealtimeSession(llm.RealtimeSession):
         self._pending_generation_fut = fut
 
         if self._in_user_activity:
+            # Preserve the final partial 50 ms chunk before closing the activity.
+            for frame in self._bstream.flush():
+                self._send_client_event(
+                    types.LiveClientRealtimeInput(
+                        audio=types.Blob(
+                            data=frame.data.tobytes(),
+                            mime_type=f"audio/pcm;rate={INPUT_AUDIO_SAMPLE_RATE}",
+                        )
+                    )
+                )
             self._send_client_event(
                 types.LiveClientRealtimeInput(
                     activity_end=types.ActivityEnd(),
                 )
             )
             self._in_user_activity = False
+            self._active_input_audio.clear()
 
         turns = []
         if is_given(instructions):
@@ -881,7 +1021,9 @@ class RealtimeSession(llm.RealtimeSession):
                 if self._pending_generation_fut is fut:
                     self._pending_generation_fut = None
 
-        timeout_handle = asyncio.get_event_loop().call_later(5.0, _on_timeout)
+        timeout_handle = asyncio.get_event_loop().call_later(
+            self._opts.conn_options.timeout, _on_timeout
+        )
 
         def _on_fut_done(f: asyncio.Future[llm.GenerationCreatedEvent]) -> None:
             timeout_handle.cancel()
@@ -902,6 +1044,7 @@ class RealtimeSession(llm.RealtimeSession):
 
         if not self._in_user_activity:
             self._in_user_activity = True
+            self._active_input_audio.clear()
             self._send_client_event(
                 types.LiveClientRealtimeInput(
                     activity_start=types.ActivityStart(),
@@ -911,13 +1054,24 @@ class RealtimeSession(llm.RealtimeSession):
     def interrupt(self) -> None:
         # Gemini Live treats activity start as interruption, so we rely on start_user_activity
         # notifications to handle it
+        if self._current_generation is None or self._current_generation._done:
+            # An idle typed turn is not microphone activity. An empty manual
+            # activity followed by activity_end is rejected by the Live API.
+            return
         if (
             self._opts.realtime_input_config
             and self._opts.realtime_input_config.activity_handling
             == types.ActivityHandling.NO_INTERRUPTION
         ):
             return
-        self.start_user_activity()
+        if not self._in_user_activity:
+            # Cancel provider speech without claiming that microphone PCM exists.
+            # The runtime truncates/reseeds unheard history before the next reply.
+            # Replaying an empty activity on that fresh socket makes Google reject
+            # a subsequent typed turn with 1007 when generate_reply ends it.
+            self._send_client_event(
+                types.LiveClientRealtimeInput(activity_start=types.ActivityStart())
+            )
 
     def truncate(
         self,
@@ -927,8 +1081,29 @@ class RealtimeSession(llm.RealtimeSession):
         audio_end_ms: int,
         audio_transcript: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
-        logger.warning("truncate is not supported by the Google Realtime API.")
-        pass
+        self._mark_current_generation_done()
+        context = self.chat_ctx.copy()
+        original = context.get_by_id(message_id)
+        position = next(
+            (i for i, item in enumerate(context.items) if item.id == message_id), len(context.items)
+        )
+        context.items[:] = [item for item in context.items if item.id != message_id]
+        if is_given(audio_transcript) and audio_transcript:
+            if isinstance(original, llm.ChatMessage):
+                context.items.insert(
+                    position,
+                    original.model_copy(
+                        update={
+                            "content": [audio_transcript],
+                            "interrupted": True,
+                        }
+                    ),
+                )
+            else:
+                context.add_message(
+                    id=message_id, role="assistant", content=audio_transcript, interrupted=True
+                )
+        self._reset_chat_ctx(context)
 
     async def aclose(self) -> None:
         self._msg_ch.close()
@@ -968,6 +1143,9 @@ class RealtimeSession(llm.RealtimeSession):
             await self._close_active_session()
 
             self._session_should_close.clear()
+            # A restart replaces the channel. This socket must never consume the
+            # replacement's queued input, even if its handshake finishes late.
+            msg_ch = self._msg_ch
             session = None
             try:
                 config = self._build_connect_config()
@@ -979,6 +1157,8 @@ class RealtimeSession(llm.RealtimeSession):
                     self._report_connection_acquired(time.perf_counter() - t0)
                     async with self._session_lock:
                         self._active_session = session
+                        if self._session_should_close.is_set():
+                            continue
 
                         pending_ctx, self._pending_chat_ctx = self._pending_chat_ctx, None
                         if self._session_resumption_handle is not None:
@@ -991,6 +1171,12 @@ class RealtimeSession(llm.RealtimeSession):
                         else:
                             if pending_ctx is not None:
                                 self._chat_ctx = pending_ctx
+
+                            self._retired_tool_call_ids.update(
+                                item.call_id
+                                for item in self._chat_ctx.items
+                                if isinstance(item, (llm.FunctionCall, llm.FunctionCallOutput))
+                            )
 
                             system_msg_count = sum(
                                 1
@@ -1006,7 +1192,15 @@ class RealtimeSession(llm.RealtimeSession):
                                     f"update_instructions() to set system-level context instead."
                                 )
 
-                            turns_dict, _ = self._chat_ctx.copy(
+                            restored_ctx = llm.ChatContext(
+                                items=[
+                                    _restored_tool_result(item)
+                                    if isinstance(item, llm.FunctionCallOutput)
+                                    else item
+                                    for item in self._chat_ctx.items
+                                ]
+                            )
+                            turns_dict, _ = restored_ctx.copy(
                                 exclude_function_call=True,
                                 exclude_handoff=True,
                                 exclude_instructions=True,
@@ -1023,7 +1217,7 @@ class RealtimeSession(llm.RealtimeSession):
 
                     # queue up existing chat context
                     send_task = asyncio.create_task(
-                        self._send_task(session), name="gemini-realtime-send"
+                        self._send_task(session, msg_ch=msg_ch), name="gemini-realtime-send"
                     )
                     recv_task = asyncio.create_task(
                         self._recv_task(session), name="gemini-realtime-recv"
@@ -1032,29 +1226,28 @@ class RealtimeSession(llm.RealtimeSession):
                         self._session_should_close.wait(), name="gemini-restart-wait"
                     )
 
-                    done, pending = await asyncio.wait(
-                        [send_task, recv_task, restart_wait_task],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    try:
+                        done, _ = await asyncio.wait(
+                            [send_task, recv_task, restart_wait_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
 
-                    for task in done:
-                        if task is not restart_wait_task and task.exception():
-                            logger.error(f"error in task {task.get_name()}: {task.exception()}")
-                            raise task.exception() or Exception(f"{task.get_name()} failed")
+                        for task in done:
+                            if task is not restart_wait_task and task.exception():
+                                logger.error(f"error in task {task.get_name()}: {task.exception()}")
+                                raise task.exception() or Exception(f"{task.get_name()} failed")
 
-                    if restart_wait_task not in done and self._msg_ch.closed:
-                        break
+                        if restart_wait_task not in done and self._msg_ch.closed:
+                            break
 
-                    for task in pending:
-                        await utils.aio.cancel_and_wait(task)
-
-                    # the recv/send tasks signal restart by setting _session_should_close
-                    # rather than raising. propagate any error they recorded so the handler
-                    # below can bound retries and surface it through the "error" event.
-                    if self._session_error is not None:
-                        err = self._session_error
-                        self._session_error = None
-                        raise err
+                        # The recv/send tasks can signal a restart instead of raising.
+                        if self._session_error is not None:
+                            err = self._session_error
+                            self._session_error = None
+                            raise err
+                    finally:
+                        # Cancellation and errors must retire every socket-owned task.
+                        await utils.aio.cancel_and_wait(send_task, recv_task, restart_wait_task)
 
             except asyncio.CancelledError:
                 break
@@ -1067,20 +1260,19 @@ class RealtimeSession(llm.RealtimeSession):
                     logger.error(f"Gemini Realtime API error: {e}", exc_info=e)
 
                 if not self._msg_ch.closed:
-                    # Gemini Live closes with 1007 ("Request contains an invalid argument")
-                    # when the session context is exhausted. Reconnecting replays the same
-                    # oversized chat context and fails identically, producing a tight retry
-                    # loop, so treat it as fatal to the session instead of retrying.
+                    # 1007 also covers invalid activity sequencing, not only exhausted
+                    # context. Replaying the unchanged request can fail identically;
+                    # retain the provider error without guessing a specific cause.
                     if getattr(e, "code", None) == 1007 or "1007" in str(e):
                         logger.error(
-                            "Gemini Live closed the session: context exhausted (1007). "
-                            "Reconnecting would replay the same context and fail again; "
+                            "Gemini Live rejected a request (1007). "
+                            "Reconnecting would replay the same request; "
                             "terminating the session.",
                             exc_info=e,
                         )
                         self._emit_error(e, recoverable=False)
                         raise APIConnectionError(
-                            message="Gemini Live session context exhausted (1007)"
+                            message="Gemini Live request rejected (1007)"
                         ) from e
 
                     # we shouldn't retry when it's not connected, usually this means incorrect
@@ -1111,19 +1303,18 @@ class RealtimeSession(llm.RealtimeSession):
             finally:
                 await self._close_active_session()
 
-    async def _send_task(self, session: AsyncSession) -> None:
+    async def _send_task(
+        self, session: AsyncSession, *, msg_ch: utils.aio.Chan[ClientEvents] | None = None
+    ) -> None:
         try:
-            async for msg in self._msg_ch:
+            async for msg in self._msg_ch if msg_ch is None else msg_ch:
                 async with self._session_lock:
                     if self._session_should_close.is_set() or (
                         not self._active_session or self._active_session != session
                     ):
                         break
                 if isinstance(msg, types.LiveClientContent):
-                    await session.send_client_content(
-                        turns=msg.turns,  # type: ignore
-                        turn_complete=msg.turn_complete if msg.turn_complete is not None else True,
-                    )
+                    await session.send_client_content(**_to_client_content_params(msg))  # type: ignore
                 elif isinstance(msg, types.LiveClientToolResponse) and msg.function_responses:
                     await session.send_tool_response(function_responses=msg.function_responses)
                 elif isinstance(msg, types.LiveClientRealtimeInput):
@@ -1177,6 +1368,8 @@ class RealtimeSession(llm.RealtimeSession):
                         break
 
                 async for response in session.receive():
+                    if self._session_should_close.is_set() or self._active_session is not session:
+                        break
                     if lk_google_debug:
                         resp_copy = response.model_dump(exclude_defaults=True)
                         # remove audio from debugging logs
@@ -1425,7 +1618,11 @@ class RealtimeSession(llm.RealtimeSession):
                     except ValueError as e:
                         logger.error(f"Error creating audio frame from Gemini data: {e}")
 
-        if input_transcription := server_content.input_transcription:
+        # Some model versions emit ASR even when it was not requested. External
+        # STT owns that input; accepting another transcript invents a second turn.
+        if self.capabilities.user_transcription and (
+            input_transcription := server_content.input_transcription
+        ):
             text = input_transcription.text
             if text:
                 if current_gen.input_transcription == "":
@@ -1568,14 +1765,14 @@ class RealtimeSession(llm.RealtimeSession):
         gen = self._current_generation
         for fnc_call in tool_call.function_calls or []:
             arguments = json.dumps(fnc_call.args)
-
-            gen.function_ch.send_nowait(
-                llm.FunctionCall(
-                    call_id=fnc_call.id or utils.shortuuid("fnc-call-"),
-                    name=fnc_call.name,
-                    arguments=arguments,
-                )
+            call = llm.FunctionCall(
+                call_id=fnc_call.id or utils.shortuuid("fnc-call-"),
+                name=fnc_call.name,
+                arguments=arguments,
             )
+            self._retired_tool_call_ids.discard(call.call_id)
+            self._chat_ctx.items.append(call)
+            gen.function_ch.send_nowait(call)
         self._mark_current_generation_done()
 
     def _handle_tool_call_cancellation(
