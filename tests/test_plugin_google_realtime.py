@@ -5,6 +5,7 @@ import gc
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,6 +17,22 @@ from livekit.plugins.google.realtime.realtime_api import RealtimeModel, Realtime
 from livekit.plugins.google.utils import create_function_response
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("values", [[-1, 0, 1], [-2, 2]])
+def test_integer_tool_literals_retain_their_exact_range(values: list[int]) -> None:
+    from livekit.plugins.google.utils import _GeminiJsonSchema
+
+    schema = types.Schema.model_validate(
+        _GeminiJsonSchema({"type": "integer", "enum": values}).simplify()
+    )
+    assert schema.enum is None
+    allowed = []
+    for value in range(-3, 4):
+        alternatives = schema.any_of or [schema]
+        if any(item.minimum <= value <= item.maximum for item in alternatives):
+            allowed.append(value)
+    assert allowed == values
 
 
 def _is_genai_client_teardown(task: asyncio.Task[Any]) -> bool:
@@ -88,6 +105,72 @@ async def _make_configured_session(
         yield session
     finally:
         await session.aclose()
+
+
+@pytest.mark.parametrize("model", ["gemini-3.1-flash-live-preview", "gemini-3.8-live"])
+async def test_current_models_accept_silent_instruction_and_context_updates(
+    monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    async with _make_configured_session(monkeypatch, model=model) as session:
+        events: list[Any] = []
+        session._send_client_event = events.append  # type: ignore[method-assign]
+        session._active_session = object()  # type: ignore[assignment]
+        try:
+            await session.update_instructions("The current scene is the workshop.")
+            context = llm.ChatContext.empty()
+            context.add_message(role="user", content="The selected object is now the bench.")
+            await session.update_chat_ctx(context)
+            assert len(events) == 2
+            assert all(event.turn_complete is False for event in events)
+            assert events[0].turns[0].role == "model"
+            assert events[1].turns[0].parts[0].text == "The selected object is now the bench."
+        finally:
+            session._active_session = None
+
+
+@pytest.mark.parametrize("model", ["gemini-3.1-flash-live-preview", "gemini-3.8-live"])
+async def test_current_models_request_reply_without_a_placeholder_turn(
+    monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    async with _make_configured_session(monkeypatch, model=model) as session:
+        events: list[Any] = []
+        session._send_client_event = events.append  # type: ignore[method-assign]
+        reply = session.generate_reply()
+        try:
+            assert len(events) == 1
+            assert events[0].turn_complete is True
+            assert not events[0].turns
+        finally:
+            reply.cancel()
+            await asyncio.sleep(0)
+
+
+async def test_sender_omits_empty_turns_but_preserves_context_only_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(monkeypatch, model="gemini-3.8-live") as session:
+        sent: list[dict[str, Any]] = []
+
+        async def send_client_content(**kwargs: Any) -> None:
+            assert kwargs.get("turns") != [], "Google rejects an explicitly empty turns list"
+            sent.append(kwargs)
+
+        transport = SimpleNamespace(send_client_content=send_client_content)
+        session._active_session = transport
+        session._session_should_close.clear()
+        session._msg_ch = utils.aio.Chan()
+        session._msg_ch.send_nowait(types.LiveClientContent(turns=[], turn_complete=True))
+        turns = [types.Content(role="user", parts=[types.Part(text="Updated scene")])]
+        session._msg_ch.send_nowait(types.LiveClientContent(turns=turns, turn_complete=False))
+        session._msg_ch.close()
+        try:
+            await session._send_task(transport)
+            assert sent == [
+                {"turn_complete": True},
+                {"turns": turns, "turn_complete": False},
+            ]
+        finally:
+            session._active_session = None
 
 
 def _audio_content(**kwargs: object) -> types.LiveServerContent:
@@ -345,6 +428,25 @@ async def test_input_transcription_uses_generation_timestamp(
         ]
 
 
+async def test_disabled_input_transcription_does_not_duplicate_external_stt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(
+        monkeypatch, model="gemini-3.8-live", input_audio_transcription=None
+    ) as session:
+        transcripts: list[llm.InputTranscriptionCompleted] = []
+        session.on("input_audio_transcription_completed", transcripts.append)
+        session._chat_ctx.add_message(id="external-final", role="user", content="Read my reward.")
+        session._start_new_generation()
+        session._handle_server_content(
+            types.LiveServerContent(input_transcription=types.Transcription(text="my reward"))
+        )
+        session._handle_server_content(types.LiveServerContent(turn_complete=True))
+        assert not session.capabilities.user_transcription
+        assert transcripts == []
+        assert [message.id for message in session.chat_ctx.messages()] == ["external-final"]
+
+
 async def test_session_close_releases_the_genai_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -536,14 +638,14 @@ class _FakeLiveSession:
         self.sent: list[tuple[str, object]] = []
         self._closed = asyncio.Event()
 
-    async def send_client_content(self, *, turns: object, turn_complete: bool) -> None:
+    async def send_client_content(self, *, turns: object = None, turn_complete: bool) -> None:
         self.sent.append(("content", turns))
 
     async def send_tool_response(self, *, function_responses: object) -> None:
         self.sent.append(("tool_response", function_responses))
 
     async def send_realtime_input(self, **kwargs: object) -> None:
-        pass
+        self.sent.append(("realtime", kwargs))
 
     async def receive(self) -> AsyncIterator[types.LiveServerMessage]:
         await self._closed.wait()
@@ -619,6 +721,533 @@ async def test_fresh_session_replays_chat_ctx(monkeypatch: pytest.MonkeyPatch) -
     async with _connected_session(monkeypatch, handle=None, pending=ctx) as (session, fake):
         assert _texts(fake.sent) == [["hello", "hi"]]
         assert session._pending_chat_ctx is None
+
+
+async def test_context_restart_during_connect_keeps_the_new_reply_on_the_new_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai.live import AsyncLive
+
+    connecting, release = asyncio.Event(), asyncio.Event()
+    sockets = []
+
+    class Socket(_FakeLiveSession):
+        def __init__(self):
+            super().__init__()
+            self.completions = 0
+            self.incoming = asyncio.Queue()
+
+        async def send_client_content(self, *, turns=None, turn_complete):
+            await super().send_client_content(turns=turns, turn_complete=turn_complete)
+            if turn_complete:
+                self.completions += 1
+                await self.incoming.put(
+                    types.LiveServerMessage(
+                        server_content=types.LiveServerContent(
+                            model_turn=types.Content(
+                                role="model", parts=[types.Part(text="Ready.")]
+                            ),
+                            generation_complete=True,
+                            turn_complete=True,
+                        )
+                    )
+                )
+
+        async def receive(self):
+            while not self._closed.is_set():
+                yield await self.incoming.get()
+
+    @asynccontextmanager
+    async def connect(self, **kwargs):
+        socket = Socket()
+        sockets.append(socket)
+        assert len(sockets) <= 2
+        if len(sockets) == 1:
+            connecting.set()
+            await release.wait()
+        yield socket
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    model = RealtimeModel(model="gemini-3.8-live")
+    session = model.session()
+    try:
+        await asyncio.wait_for(connecting.wait(), 1)
+        await session.update_instructions("Current campaign and NPC roster.")
+        context = llm.ChatContext.empty()
+        context.add_message(id="original-player-input", role="user", content="Recall my reward.")
+        await session.update_chat_ctx(context)
+        reply = session.generate_reply()
+        release.set()
+        await asyncio.wait_for(reply, 2)
+        assert len(sockets) == 2
+        assert [socket.completions for socket in sockets] == [0, 1]
+        assert _texts(sockets[1].sent[:1]) == [["Recall my reward."]]
+        assert [message.id for message in session.chat_ctx.messages()].count(
+            "original-player-input"
+        ) == 1
+    finally:
+        release.set()
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_generate_reply_uses_the_configured_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    from livekit.agents import APIConnectOptions
+
+    async with _make_configured_session(
+        monkeypatch, model="gemini-3.8-live", conn_options=APIConnectOptions(timeout=0.02)
+    ) as session:
+        with pytest.raises(llm.RealtimeError, match="timed out"):
+            await asyncio.wait_for(session.generate_reply(), 0.2)
+
+
+@pytest.mark.parametrize("change", ["remove", "replace"])
+async def test_replacing_google_history_discards_the_old_resumption_handle(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    async with _make_configured_session(monkeypatch, model="gemini-3.8-live") as session:
+        known = llm.ChatContext.empty()
+        known.add_message(id="scene", role="user", content="Old canonical image facts")
+        updated = llm.ChatContext.empty()
+        if change == "replace":
+            updated.add_message(id="scene", role="user", content="New canonical image facts")
+        session._chat_ctx = known
+        session._session_resumption_handle = "would-restore-forbidden-history"
+        session._resumption_chat_ctx = known.copy()
+        session._active_session = object()  # type: ignore[assignment]
+        try:
+            await session.update_chat_ctx(updated)
+            assert session._session_should_close.is_set()
+            assert session._session_resumption_handle is None
+            assert session._resumption_chat_ctx is None
+            assert session.chat_ctx.to_dict() == updated.to_dict()
+        finally:
+            session._active_session = None
+
+
+async def test_interrupted_google_reply_restarts_with_only_the_heard_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(monkeypatch, model="gemini-3.8-live") as session:
+        context = llm.ChatContext.empty()
+        context.add_message(id="reply", role="assistant", content="Heard. Never played.")
+        session._chat_ctx = context
+        session._session_resumption_handle = "old-full-answer"
+        session.truncate(
+            message_id="reply",
+            modalities=["audio", "text"],
+            audio_end_ms=1000,
+            audio_transcript="Heard.",
+        )
+        assert session._session_resumption_handle is None
+        assert session.chat_ctx.get_by_id("reply").text_content == "Heard."
+        assert session._session_should_close.is_set()
+
+
+async def test_same_canonical_image_with_new_local_cache_id_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(monkeypatch, model="gemini-3.8-live") as session:
+        original, refreshed = llm.ChatContext.empty(), llm.ChatContext.empty()
+        for ctx in (original, refreshed):
+            ctx.add_message(
+                id="scene",
+                role="user",
+                content=[
+                    "Scene revision 2",
+                    llm.ImageContent(image="https://fixture.invalid/current.png"),
+                ],
+            )
+        session._chat_ctx = original
+        session._session_should_close.clear()
+        session._active_session = object()  # type: ignore[assignment]
+        try:
+            await session.update_chat_ctx(refreshed)
+            assert not session._session_should_close.is_set()
+            changed = llm.ChatContext.empty()
+            changed.add_message(
+                id="scene",
+                role="user",
+                content=[
+                    "Scene revision 3",
+                    llm.ImageContent(image="https://fixture.invalid/new.png"),
+                ],
+            )
+            await session.update_chat_ctx(changed)
+            assert session._session_should_close.is_set()
+        finally:
+            session._active_session = None
+
+
+async def test_unheard_google_reply_is_not_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(monkeypatch, model="gemini-3.8-live") as session:
+        session._start_new_generation()
+        generation = session._current_generation
+        generation.output_text = "Never heard."
+        session.truncate(
+            message_id=generation.response_id,
+            modalities=["audio"],
+            audio_end_ms=0,
+            audio_transcript="",
+        )
+        assert session.chat_ctx.get_by_id(generation.response_id) is None
+        assert generation._done
+
+
+async def test_idle_interrupt_does_not_create_an_empty_manual_audio_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(
+        monkeypatch,
+        model="gemini-3.8-live",
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        ),
+    ) as session:
+        session.interrupt()
+        assert not session._in_user_activity
+        session._start_new_generation()
+        session.interrupt()
+        assert not session._in_user_activity
+
+
+async def test_typed_interrupt_does_not_replay_empty_microphone_activity_on_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(
+        monkeypatch,
+        model="gemini-3.8-live",
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        ),
+    ) as session:
+        events: list[Any] = []
+        session._send_client_event = events.append  # type: ignore[method-assign]
+        session._start_new_generation()
+        reply = session._current_generation
+        session.interrupt()
+        assert len(events) == 1 and events[0].activity_start is not None
+        events.clear()
+        session.truncate(
+            message_id=reply.response_id,
+            modalities=["audio"],
+            audio_end_ms=2000,
+            audio_transcript="",
+        )
+        context = session.chat_ctx.copy()
+        context.add_message(id="typed-after-interruption", role="user", content="What did I earn?")
+        await session.update_chat_ctx(context)
+        future = session.generate_reply()
+        try:
+            assert not any(isinstance(event, types.LiveClientRealtimeInput) for event in events)
+            assert any(
+                isinstance(event, types.LiveClientContent) and event.turn_complete
+                for event in events
+            )
+            assert session.chat_ctx.get_by_id("typed-after-interruption") is not None
+        finally:
+            future.cancel()
+
+
+async def test_truncated_history_reconnects_without_replaying_tools_or_old_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai.live import AsyncLive
+
+    sockets: list[_FakeLiveSession] = []
+    configurations: list[Any] = []
+
+    @asynccontextmanager
+    async def connect(self: AsyncLive, **kwargs: Any) -> AsyncIterator[_FakeLiveSession]:
+        socket = _FakeLiveSession()
+        sockets.append(socket)
+        configurations.append(kwargs["config"])
+        yield socket
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    session = RealtimeModel(model="gemini-3.8-live").session()
+    context = llm.ChatContext.empty()
+    context.add_message(id="question", role="user", content="What did I earn?")
+    context.add_message(id="reply", role="assistant", content="A meal. Unheard extra reward.")
+    context.items.extend(
+        [
+            llm.FunctionCall(id="call", call_id="lookup-1", name="lookup_reward", arguments="{}"),
+            llm.FunctionCallOutput(
+                id="result",
+                call_id="lookup-1",
+                name="lookup_reward",
+                output="A meal.",
+                is_error=False,
+            ),
+        ]
+    )
+    await session.update_chat_ctx(context)
+    try:
+        async with asyncio.timeout(2):
+            while len(sockets) != 1 or not sockets[0].sent:
+                await asyncio.sleep(0)
+            session._session_resumption_handle = "must-not-resume-unheard-content"
+            session.truncate(
+                message_id="reply",
+                modalities=["audio", "text"],
+                audio_end_ms=900,
+                audio_transcript="A meal.",
+            )
+            # A finalized turn arriving during reconnect must survive the replacement.
+            latest = session.chat_ctx.copy()
+            latest.add_message(id="next", role="user", content="And a place to sleep?")
+            await session.update_chat_ctx(latest)
+            while len(sockets) != 2 or not sockets[1].sent:
+                await asyncio.sleep(0)
+        assert sockets[0]._closed.is_set()
+        assert configurations[1].session_resumption.handle is None
+        restored = _texts(sockets[1].sent)[0]
+        assert restored[:2] == ["What did I earn?", "A meal."]
+        assert '"output": "A meal."' in restored[2]
+        assert "already completed" in restored[2]
+        assert restored[3] == "And a place to sleep?"
+        assert all(kind == "content" for kind, _ in sockets[1].sent)
+        assert session.chat_ctx.get_by_id("result") is not None
+        assert session.chat_ctx.get_by_id("next") is not None
+        assert session._pending_generation_fut is None
+    finally:
+        await session.aclose()
+
+
+async def test_history_reset_preserves_in_progress_manual_audio_once_on_new_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai.live import AsyncLive
+
+    from livekit import rtc
+    from livekit.plugins.google.realtime.realtime_api import INPUT_AUDIO_SAMPLE_RATE
+
+    sockets: list[_FakeLiveSession] = []
+    configurations: list[Any] = []
+
+    @asynccontextmanager
+    async def connect(self: AsyncLive, **kwargs: Any) -> AsyncIterator[_FakeLiveSession]:
+        socket = _FakeLiveSession()
+        sockets.append(socket)
+        configurations.append(kwargs["config"])
+        yield socket
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    session = RealtimeModel(
+        model="gemini-3.8-live",
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        ),
+    ).session()
+
+    def audio(milliseconds: int, byte: int) -> bytes:
+        data = bytes([byte]) * (INPUT_AUDIO_SAMPLE_RATE * milliseconds // 1000 * 2)
+        session.push_audio(rtc.AudioFrame(data, INPUT_AUDIO_SAMPLE_RATE, 1, len(data) // 2))
+        return data
+
+    try:
+        async with asyncio.timeout(2):
+            while not sockets or session._active_session is None:
+                await asyncio.sleep(0)
+            session.start_user_activity()
+            prefix = audio(100, 1)
+            partial = audio(20, 2)
+            while len(sockets[0].sent) < 3:
+                await asyncio.sleep(0)
+            session._session_resumption_handle = "old-audio-handle"
+            session._reset_chat_ctx(session.chat_ctx)
+            suffix = audio(45, 3)
+            generation = session.generate_reply()
+            while len(sockets) < 2 or len(sockets[1].sent) < 7:
+                await asyncio.sleep(0)
+        events = [event for kind, event in sockets[1].sent if kind == "realtime"]
+        assert "activity_start" in events[0]
+        assert "activity_end" in events[-1]
+        assert sum("activity_start" in event for event in events) == 1
+        assert sum("activity_end" in event for event in events) == 1
+        assert (
+            b"".join(event["audio"].data for event in events if "audio" in event)
+            == prefix + partial + suffix
+        )
+        assert configurations[1].session_resumption.handle is None
+        assert session._active_input_audio == []
+        generation.cancel()
+    finally:
+        await session.aclose()
+
+
+async def test_result_of_a_call_from_retired_connection_is_context_not_tool_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(
+        monkeypatch,
+        model="gemini-3.8-live",
+        tool_behavior=types.Behavior.NON_BLOCKING,
+        tool_response_scheduling=types.FunctionResponseScheduling.SILENT,
+    ) as session:
+        events: list[Any] = []
+        session._send_client_event = events.append  # type: ignore[method-assign]
+        session._start_new_generation()
+        session._handle_tool_calls(
+            types.LiveServerToolCall(
+                function_calls=[
+                    types.FunctionCall(id="reward-lookup", name="lookup_reward", args={})
+                ]
+            )
+        )
+        context = session.chat_ctx.copy()
+        session._reset_chat_ctx(context)
+        session._session_should_close.clear()
+        session._active_session = object()  # type: ignore[assignment]
+        try:
+            context.items.append(
+                llm.FunctionCallOutput(
+                    id="reward-result",
+                    call_id="reward-lookup",
+                    name="lookup_reward",
+                    output="A meal and a loft bunk.",
+                    is_error=False,
+                )
+            )
+            await session.update_chat_ctx(context)
+            assert not session.capabilities.auto_tool_reply_generation
+            assert len(events) == 1
+            assert isinstance(events[0], types.LiveClientContent)
+            assert events[0].turn_complete is False
+            assert "A meal and a loft bunk." in events[0].turns[0].parts[0].text
+            assert "already completed" in events[0].turns[0].parts[0].text
+        finally:
+            session._active_session = None
+
+
+async def test_agent_session_finishes_tool_reply_after_native_speech_rejection_and_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from google.genai.live import AsyncLive
+
+    from livekit.agents import Agent, AgentSession, function_tool
+
+    from .fake_io import FakeAudioOutput, FakeTextOutput
+
+    sockets = []
+    second_connected = asyncio.Event()
+
+    class Socket(_FakeLiveSession):
+        def __init__(self, number):
+            super().__init__()
+            self.number = number
+            self.incoming = asyncio.Queue()
+
+        async def send_client_content(self, *, turns=None, turn_complete=True):
+            self.sent.append(("content", turns or []))
+            if not turn_complete:
+                return
+            text = "Ten gold coins." if self.number == 1 else "A meal and a loft bunk."
+            self.incoming.put_nowait(
+                types.LiveServerMessage(
+                    server_content=_audio_content(
+                        output_transcription=types.Transcription(text=text),
+                        turn_complete=self.number != 1,
+                    )
+                )
+            )
+            if self.number == 1:
+                self.incoming.put_nowait(
+                    types.LiveServerMessage(
+                        tool_call=types.LiveServerToolCall(
+                            function_calls=[
+                                types.FunctionCall(id="fixed-lookup", name="lookup_reward", args={})
+                            ]
+                        )
+                    )
+                )
+
+        async def send_tool_response(self, *, function_responses):
+            raise AssertionError("The replacement socket never issued that old call")
+
+        async def receive(self):
+            while not self._closed.is_set():
+                yield await self.incoming.get()
+
+    @asynccontextmanager
+    async def connect(self, **kwargs):
+        socket = Socket(len(sockets) + 1)
+        sockets.append(socket)
+        assert len(sockets) <= 2
+        if len(sockets) == 2:
+            second_connected.set()
+        yield socket
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    model = RealtimeModel(
+        model="gemini-3.8-live",
+        tool_behavior=types.Behavior.NON_BLOCKING,
+        tool_response_scheduling=types.FunctionResponseScheduling.SILENT,
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        ),
+    )
+    calls = []
+
+    class CheckedAgent(Agent):
+        @function_tool()
+        async def lookup_reward(self) -> str:
+            """Look up the already-earned reward, without changing it."""
+            calls.append("lookup_reward")
+            await second_connected.wait()
+            return "A meal and a loft bunk."
+
+        async def realtime_output_node(self, message, model_settings):
+            text = "".join([str(chunk) async for chunk in message.text_stream])
+            frames = [frame async for frame in message.audio_stream]
+            if text == "Ten gold coins.":
+                session._activity._rt_session.truncate(
+                    message_id=message.message_id,
+                    modalities=["audio", "text"],
+                    audio_end_ms=0,
+                    audio_transcript="",
+                )
+                return None
+
+            async def audio():
+                for frame in frames:
+                    yield frame
+
+            async def words():
+                yield text
+
+            return replace(message, audio_stream=audio(), text_stream=words())
+
+    try:
+        async with AgentSession(llm=model, turn_handling={"turn_detection": "manual"}) as session:
+            text_output = FakeTextOutput()
+            session.output.audio, session.output.transcription = FakeAudioOutput(), text_output
+            await session.start(CheckedAgent(instructions="Use the fixed reward lookup."))
+            handle = session.generate_reply(user_input="What did I earn?")
+            await asyncio.wait_for(handle, 3)
+            await asyncio.wait_for(session.wait_for_idle(), 3)
+            assert calls == ["lookup_reward"]
+            assert len(sockets) == 2
+            assert "Ten gold coins." not in text_output._messages
+            assert "A meal and a loft bunk." in text_output._messages
+            assert any(
+                "A meal and a loft bunk." in text
+                for texts in _texts(sockets[1].sent)
+                for text in texts
+            )
+            assert not any(
+                message.text_content == "Ten gold coins." for message in session.history.messages()
+            )
+    finally:
+        await model.aclose()
 
 
 async def test_resumed_session_skips_chat_ctx_replay(monkeypatch: pytest.MonkeyPatch) -> None:

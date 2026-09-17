@@ -174,6 +174,24 @@ class _GeminiJsonSchema:
         if "enum" in schema and "type" not in schema:
             schema["type"] = self._infer_type(schema["enum"][0])
 
+        # Gemini's OpenAPI Schema accepts only string enum values. Represent an
+        # integer literal set with exact numeric bounds instead of stringifying
+        # tool arguments or dropping their validation constraint.
+        values = schema.get("enum")
+        if values and all(type(value) is int for value in values):
+            ordered = sorted(set(values))
+            schema.pop("enum")
+            schema["type"] = "integer"
+            if ordered[-1] - ordered[0] + 1 == len(ordered):
+                schema.update(
+                    minimum=max(ordered[0], schema.get("minimum", ordered[0])),
+                    maximum=min(ordered[-1], schema.get("maximum", ordered[-1])),
+                )
+            else:
+                schema["anyOf"] = [
+                    {"type": "integer", "minimum": value, "maximum": value} for value in ordered
+                ]
+
         # Convert type value to Gemini format
         if "type" in schema and schema["type"] != "null":
             json_type = schema["type"]

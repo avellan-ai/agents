@@ -5,8 +5,8 @@ there is a single source of truth for LLM instructions and markup stripping
 per provider.
 
 Provider docs:
-- Cartesia: https://docs.cartesia.ai/build-with-cartesia/sonic-3/ssml-tags
-- Cartesia: https://docs.cartesia.ai/build-with-cartesia/sonic-3/volume-speed-emotion
+- Cartesia: https://docs.cartesia.ai/build-with-cartesia/capability-guides/ssml-tags
+- Cartesia: https://docs.cartesia.ai/build-with-cartesia/capability-guides/volume-speed-emotion
 - Inworld: https://docs.inworld.ai/tts/capabilities/steering
 - Inworld: https://docs.inworld.ai/tts/best-practices/prompting-for-tts-2
 - xAI: https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
@@ -248,18 +248,25 @@ playful, or celebratory, let it loosen and brighten. A serious turn in an otherw
 casual conversation still gets a composed reply."""
 
 _CARTESIA_EXPR_LLM_INSTRUCTIONS = (
-    _EXPR_PREAMBLE
+    "Use <expr/> markers only when they help convey the intended delivery. "
+    "Natural wording and punctuation are the baseline; do not decorate every sentence. "
+    "Match emotion to the words. Match delivery to the REGISTER of the moment; "
+    "keep serious moments composed and let casual, playful moments brighten. "
+    "Use only the marker types and labels listed below, not native provider tags or "
+    "raw bracket cues. Never read or describe the markers aloud."
     + """
 
-1. Emotion - sets the emotional tone. Self-closing; place before EVERY sentence.
+1. Emotion - optional emotional guidance for English. Self-closing; place before the words it guides.
    <expr type="expression" label="EMOTION"/>
    Labels are a fixed vocabulary, NOT free-form descriptions. Best results: neutral, \
-angry, excited, content, sad, scared.
-   Also available: happy, enthusiastic, elated, triumphant, amazed, surprised, \
-flirtatious, curious, peaceful, serene, calm, grateful, affectionate, sympathetic, \
-mysterious, frustrated, disgusted, sarcastic, ironic, dejected, melancholic, \
-disappointed, apologetic, hesitant, confused, anxious, panicked, proud, confident, \
-contemplative, determined, joking/comedic.
+calm, angry, content, sad, scared.
+   Also available: happy, excited, enthusiastic, elated, euphoric, triumphant, amazed, \
+surprised, flirtatious, curious, peaceful, serene, grateful, affectionate, trust, \
+sympathetic, anticipation, mysterious, mad, outraged, frustrated, agitated, threatened, \
+disgusted, contempt, envious, sarcastic, ironic, dejected, melancholic, disappointed, \
+hurt, guilty, bored, tired, rejected, nostalgic, wistful, apologetic, hesitant, insecure, \
+confused, resigned, anxious, panicked, alarmed, proud, confident, distant, skeptical, \
+contemplative, determined.
 
 2. Pauses - insert silence when appropriate. Self-closing.
    <expr type="break" label="1s"/> - label is a duration in seconds or milliseconds.
@@ -274,7 +281,7 @@ contemplative, determined, joking/comedic.
    Keep punctuation out of a spell marker — a period inside is read as "dot"; add \
 spaces inside for grouped pauses (<expr type="spell">ABC 123</expr>).
 
-This voice has no non-verbal sounds and no free-form delivery descriptions — do not \
+This voice has no free-form delivery descriptions — do not \
 invent other types or labels.
 
 Examples:
@@ -590,6 +597,7 @@ English — labels are a fixed vocabulary, never translated.""",
 # Every provider's full expr sound vocabulary (the advertised labels before any
 # speech_steering filtering). Providers absent here have no non-verbal sounds.
 _PROVIDER_SOUNDS: dict[str, list[str]] = {
+    "cartesia": ["laugh"],
     "inworld": _INWORLD_SOUNDS,
     "xai": _XAI_INLINE,
     "fishaudio": _FISHAUDIO_SOUNDS,
@@ -639,13 +647,14 @@ def _allowed_prosody(provider: str, steering: SpeechSteeringOptions | None) -> l
 
 
 # NonverbalOptions field -> the provider's expr sound labels it governs. A provider
-# absent here (cartesia) has no non-verbal sounds; an empty list means the provider
+# absent here has no non-verbal sounds; an empty list means the provider
 # has no sound for that field (nothing to filter). _allowed_sounds uses this to
 # remove disabled labels from the advertised vocabulary, so a sound steering turns
 # off is never exposed to the LLM in the first place. Every label in
 # _PROVIDER_SOUNDS must be governed by exactly one field, so a steering config
 # controls the full vocabulary.
 _NONVERBAL_SOUND_LABELS: dict[str, dict[str, list[str]]] = {
+    "cartesia": {"laughing": ["laugh"]},
     "inworld": {
         "laughing": ["laugh"],
         "breathing": ["breathe"],
@@ -826,7 +835,7 @@ _EXPR_CLOSE_RE = re.compile(LEADING_WS + r"</expr\s*>")
 _EXPR_SELF_RE = re.compile(LEADING_WS + r"<expr\b(?P<attrs>[^>]*?)/\s*>")
 # a wrapping marker (prosody/spell) and its span; non-greedy, instructed not to nest
 _EXPR_WRAP_RE = re.compile(
-    LEADING_WS + r'<expr\b(?=[^>]*type="(?:prosody|spell)")(?P<attrs>[^>]*?)>'
+    LEADING_WS + r'<expr\b(?=[^>]*type="(?:prosody|spell)")(?![^>]*?/\s*>)(?P<attrs>[^>]*?)>'
     r"(?P<inner>.*?)</expr\s*>",
     re.DOTALL,
 )
@@ -947,7 +956,7 @@ def _convert_expr(provider: str, text: str) -> str:
             return ""  # xAI has no free-form delivery descriptions
         if marker_type == "sound":
             if provider == "cartesia":
-                return ""  # no non-verbal sound support
+                return "[laughter]" if label.strip().lower() == "laugh" else ""
             if provider == "xai":
                 label = _XAI_SOUND_ALIASES.get(label.lower(), label)
             if provider == "fishaudio":
@@ -984,7 +993,14 @@ def llm_instructions(provider: str, steering: SpeechSteeringOptions | None = Non
     than advertised and then revoked.
     """
     if provider == "cartesia":
-        return _CARTESIA_EXPR_LLM_INSTRUCTIONS
+        instructions = _CARTESIA_EXPR_LLM_INSTRUCTIONS
+        if _allowed_sounds(provider, steering):
+            instructions += (
+                '\n\n5. Nonverbal sound - <expr type="sound" label="laugh"/> inserts laughter. '
+                "Use sparingly, only when a laugh fits the conversation. "
+                "The only supported sound label is laugh."
+            )
+        return instructions
     if provider == "inworld":
         return _inworld_expr_llm_instructions(_allowed_sounds(provider, steering))
     if provider == "xai":

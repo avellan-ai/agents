@@ -483,6 +483,31 @@ class Agent:
         """
         return Agent.default.tts_node(self, text, model_settings)
 
+    async def realtime_context_node(self, chat_ctx: llm.ChatContext) -> llm.ChatContext:
+        """Prepare provider context for initial sync, inputs and tool continuations.
+
+        The node receives a copy; durable session history remains owned by the
+        runtime. Override to apply application context policy without replacing
+        the provider session. Explicit context updates use the same boundary.
+        """
+        return chat_ctx
+
+    def realtime_output_node(
+        self, message: llm.MessageGeneration, model_settings: ModelSettings
+    ) -> llm.MessageGeneration | None | Coroutine[Any, Any, llm.MessageGeneration | None]:
+        """Process a native reply before either audio or transcription is forwarded.
+
+        Override this node to coordinate stream identity, timing or output authority.
+        Audio can continue streaming while transcription is finalized. Return the original
+        message or replacement streams with the same message identity, or None to suppress
+        output. An exception also suppresses this message. Implementations must consume
+        audio and text concurrently when buffering and bound their own resource use.
+
+        This controls delivery only. The runtime and provider retain responsibility
+        for truncating unheard history after interruption.
+        """
+        return message
+
     def realtime_audio_output_node(
         self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
     ) -> (

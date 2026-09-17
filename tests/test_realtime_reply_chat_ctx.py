@@ -17,7 +17,7 @@ from typing import Any, cast
 
 import pytest
 
-from livekit.agents import llm
+from livekit.agents import Agent, llm
 from livekit.agents.voice import ModelSettings
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.speech_handle import SpeechHandle
@@ -29,6 +29,8 @@ pytestmark = pytest.mark.unit
 
 class _FakeActivity(SimpleNamespace):
     """The attribute surface _realtime_reply_task touches, around a FakeRealtimeSession."""
+
+    _update_realtime_chat_ctx = AgentActivity._update_realtime_chat_ctx
 
     def __init__(self, rt_session: FakeRealtimeSession) -> None:
         authorization_allowed = asyncio.Event()
@@ -49,7 +51,7 @@ class _FakeActivity(SimpleNamespace):
             tools=[],
             _on_enter_ignored_tools=lambda tool_ctx: [],
             _tool_choice=None,
-            _agent=SimpleNamespace(_chat_ctx=llm.ChatContext.empty()),
+            _agent=Agent(instructions="Fixture"),
             _session=SimpleNamespace(
                 _conversation_item_added=lambda msg: None,
                 _update_agent_state=lambda state: None,
