@@ -108,7 +108,7 @@ async def _make_configured_session(
 
 
 @pytest.mark.parametrize("model", ["gemini-3.1-flash-live-preview", "gemini-3.8-live"])
-async def test_current_models_accept_silent_instruction_and_context_updates(
+async def test_current_models_replace_system_instructions_without_fabricating_speech(
     monkeypatch: pytest.MonkeyPatch, model: str
 ) -> None:
     async with _make_configured_session(monkeypatch, model=model) as session:
@@ -120,10 +120,12 @@ async def test_current_models_accept_silent_instruction_and_context_updates(
             context = llm.ChatContext.empty()
             context.add_message(role="user", content="The selected object is now the bench.")
             await session.update_chat_ctx(context)
-            assert len(events) == 2
-            assert all(event.turn_complete is False for event in events)
-            assert events[0].turns[0].role == "model"
-            assert events[1].turns[0].parts[0].text == "The selected object is now the bench."
+            assert session._session_should_close.is_set()
+            assert events == []
+            assert session._build_connect_config().system_instruction.parts[0].text == (
+                "The current scene is the workshop."
+            )
+            assert session.chat_ctx.to_dict() == context.to_dict()
         finally:
             session._active_session = None
 
@@ -893,6 +895,81 @@ async def test_fresh_session_replays_chat_ctx(monkeypatch: pytest.MonkeyPatch) -
     async with _connected_session(monkeypatch, handle=None, pending=ctx) as (session, fake):
         assert _texts(fake.sent) == [["hello", "hi"]]
         assert session._pending_chat_ctx is None
+
+
+async def test_instruction_change_replaces_connected_system_and_preserves_completed_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai.live import AsyncLive
+
+    sockets: list[_FakeLiveSession] = []
+    configurations: list[Any] = []
+    completions: list[bool] = []
+
+    class Socket(_FakeLiveSession):
+        async def send_client_content(self, *, turns=None, turn_complete):
+            completions.append(turn_complete)
+            await super().send_client_content(turns=turns, turn_complete=turn_complete)
+
+    @asynccontextmanager
+    async def connect(self, **kwargs):
+        socket = Socket()
+        sockets.append(socket)
+        configurations.append(kwargs["config"])
+        yield socket
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    model = RealtimeModel(model="gemini-3.8-live", instructions="Greet only. No tools.")
+    session = model.session()
+    context = llm.ChatContext.empty()
+    context.add_message(id="greeting", role="assistant", content="Welcome.")
+    await session.update_chat_ctx(context)
+    try:
+        async with asyncio.timeout(2):
+            while not sockets or not sockets[0].sent:
+                await asyncio.sleep(0)
+            session._session_resumption_handle = "would-restore-greeting-only-system"
+            await session.update_instructions("Use tools to save the player's chosen stakes.")
+            assert session._session_should_close.is_set()
+            latest = session.chat_ctx.copy()
+            latest.items.extend(
+                [
+                    llm.FunctionCall(
+                        id="call", call_id="saved-stakes", name="prepare", arguments="{}"
+                    ),
+                    llm.FunctionCallOutput(
+                        id="result",
+                        call_id="saved-stakes",
+                        name="prepare",
+                        output="Saved terms A.",
+                        is_error=False,
+                    ),
+                ]
+            )
+            latest.add_message(id="choice", role="user", content="Change the approach.")
+            await session.update_chat_ctx(latest)
+            while len(sockets) != 2 or not sockets[1].sent:
+                await asyncio.sleep(0)
+        assert configurations[0].system_instruction.parts[0].text == "Greet only. No tools."
+        assert configurations[1].system_instruction.parts[0].text == (
+            "Use tools to save the player's chosen stakes."
+        )
+        assert configurations[1].session_resumption.handle is None
+        assert sockets[0]._closed.is_set()
+        restored = _texts(sockets[1].sent)[0]
+        assert restored[0] == "Welcome."
+        assert '"output": "Saved terms A."' in restored[1]
+        assert "already completed" in restored[1]
+        assert restored[2] == "Change the approach."
+        assert all(kind == "content" for kind, _ in sockets[1].sent)
+        assert not any(completions)
+        assert session.chat_ctx.get_by_id("result") is not None
+        await session.update_instructions("Use tools to save the player's chosen stakes.")
+        assert not session._session_should_close.is_set()
+    finally:
+        await session.aclose()
+        await model.aclose()
 
 
 async def test_context_restart_during_connect_keeps_the_new_reply_on_the_new_socket(
