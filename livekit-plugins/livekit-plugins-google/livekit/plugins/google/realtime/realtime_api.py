@@ -711,33 +711,12 @@ class RealtimeSession(llm.RealtimeSession):
     async def update_instructions(self, instructions: str) -> None:
         if not is_given(self._opts.instructions) or self._opts.instructions != instructions:
             self._opts.instructions = instructions
-
-            async with self._session_lock:
-                if not self._active_session:
-                    # No active session yet — restart will pick up new instructions via _build_connect_config
-                    self._mark_restart_needed()
-                    return
-
-            if not self._realtime_model.capabilities.mutable_instructions:
-                return
-
-            # Active session exists — send mid-session system instruction update (no reconnect needed)
-            logger.debug("Updating instructions mid-session")
-            self._send_client_event(
-                types.LiveClientContent(
-                    turns=[
-                        types.Content(
-                            parts=[types.Part(text=instructions)],
-                            # Both APIs error on role="system". This was role=None on the
-                            # Gemini API, which 2.5 accepted as the system role but 3.1 and
-                            # 3.8 reject with a 1007 close that kills the session. "model"
-                            # is accepted by all three and by Vertex.
-                            role="model",
-                        )
-                    ],
-                    turn_complete=False,
-                )
-            )
+            # Client content appends conversation; it cannot replace the Gemini
+            # API connection's setup.systemInstruction. Reconnect with the actual
+            # new system policy, preserving context but not the old resume handle.
+            # This coalesces with a pending context replacement and never requests
+            # a reply or replays completed tools by itself.
+            self._reset_chat_ctx(self.chat_ctx)
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         # Check for system/developer messages that will be dropped
