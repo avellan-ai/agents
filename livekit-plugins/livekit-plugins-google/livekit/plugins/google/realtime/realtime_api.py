@@ -998,6 +998,11 @@ class RealtimeSession(llm.RealtimeSession):
                 )
                 if self._pending_generation_fut is fut:
                     self._pending_generation_fut = None
+                    # Google has no response ID with which to distinguish a late
+                    # tool call from a new unsolicited generation. Retire this
+                    # socket before accepting any more output. Preserve completed
+                    # tool receipts, but neither resume nor retry the timed-out turn.
+                    self._reset_chat_ctx(self.chat_ctx)
 
         timeout_handle = asyncio.get_event_loop().call_later(
             self._opts.conn_options.timeout, _on_timeout
