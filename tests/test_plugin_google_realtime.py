@@ -1051,6 +1051,114 @@ async def test_generate_reply_uses_the_configured_timeout(monkeypatch: pytest.Mo
             await asyncio.wait_for(session.generate_reply(), 0.2)
 
 
+async def test_timed_out_reply_retires_socket_without_late_tools_or_replaying_saved_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai.live import AsyncLive
+
+    from livekit.agents import APIConnectOptions
+
+    class Socket(_FakeLiveSession):
+        def __init__(self):
+            super().__init__()
+            self.incoming = asyncio.Queue()
+            self.completions = []
+
+        async def send_client_content(self, *, turns=None, turn_complete):
+            self.completions.append(turn_complete)
+            await super().send_client_content(turns=turns, turn_complete=turn_complete)
+
+        async def receive(self):
+            while True:
+                message = await self.incoming.get()
+                if message is None:
+                    return
+                yield message
+
+        async def close(self):
+            await super().close()
+            self.incoming.put_nowait(None)
+
+    sockets = []
+    configs = []
+
+    @asynccontextmanager
+    async def connect(self, **kwargs):
+        socket = Socket()
+        sockets.append(socket)
+        configs.append(kwargs["config"])
+        yield socket
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    model = RealtimeModel(
+        model="gemini-3.8-live", conn_options=APIConnectOptions(timeout=0.05, max_retry=0)
+    )
+    session = model.session()
+    generations = []
+    session.on("generation_created", generations.append)
+    context = llm.ChatContext.empty()
+    context.add_message(id="consent", role="user", content="Proceed once.")
+    context.items.extend(
+        [
+            llm.FunctionCall(id="call", call_id="saved-roll", name="resolve_check", arguments="{}"),
+            llm.FunctionCallOutput(
+                id="receipt",
+                call_id="saved-roll",
+                name="resolve_check",
+                output='{"rawDie":5,"status":"rolled"}',
+                is_error=False,
+            ),
+        ]
+    )
+    await session.update_chat_ctx(context)
+    try:
+        async with asyncio.timeout(2):
+            while not sockets or not sockets[0].sent:
+                await asyncio.sleep(0)
+            session._session_resumption_handle = "old-provider-response"
+            with pytest.raises(llm.RealtimeError, match="timed out"):
+                await session.generate_reply()
+            sockets[0].incoming.put_nowait(
+                types.LiveServerMessage(
+                    tool_call=types.LiveServerToolCall(
+                        function_calls=[
+                            types.FunctionCall(id="late-call", name="record_outcome", args={})
+                        ],
+                    )
+                )
+            )
+            while len(sockets) < 2 or not sockets[1].sent:
+                await asyncio.sleep(0)
+            assert sockets[0]._closed.is_set()
+            assert configs[1].session_resumption.handle is None
+            assert not generations
+            assert session.chat_ctx.get_by_id("receipt") is not None
+            assert not any(
+                isinstance(item, llm.FunctionCall) and item.call_id == "late-call"
+                for item in session.chat_ctx.items
+            )
+            assert not any(sockets[1].completions)
+            assert all(kind == "content" for kind, _ in sockets[1].sent)
+            reply = session.generate_reply()
+            sockets[1].incoming.put_nowait(
+                types.LiveServerMessage(
+                    server_content=types.LiveServerContent(
+                        model_turn=types.Content(
+                            role="model", parts=[types.Part(text="The saved die is five.")]
+                        ),
+                        generation_complete=True,
+                        turn_complete=True,
+                    )
+                )
+            )
+            assert (await reply).user_initiated is True
+            assert len(generations) == 1
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
 @pytest.mark.parametrize("change", ["remove", "replace"])
 async def test_replacing_google_history_discards_the_old_resumption_handle(
     monkeypatch: pytest.MonkeyPatch, change: str
