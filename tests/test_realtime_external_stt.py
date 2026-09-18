@@ -125,3 +125,52 @@ async def test_context_policy_covers_initial_typed_tool_and_explicit_updates():
         await asyncio.wait_for(handle.wait_for_playout(), 3)
         assert sum(item.id == "original-typed-id" for item in session.history.items) == 1
         assert session.history.get_by_id("policy") is None
+
+
+async def test_split_external_input_keeps_address_when_pending_reply_is_interrupted():
+    prepared = []
+
+    class PreparedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            prepared.append(new_message)
+
+    model = FakeRealtimeModel(
+        capabilities=fake_capabilities(turn_detection=False, user_transcription=False)
+    )
+    question = "Explain how to tell a loose joint from a split brace. Advice only."
+    async with AgentSession(
+        llm=model, stt=FakeSTT(), turn_handling={"turn_detection": "manual"}
+    ) as session:
+        await session.start(
+            PreparedAgent(instructions="Route addressed NPC questions to their agent.")
+        )
+        session._activity.on_end_of_turn(_end_of_turn_info("Mara,"))
+        async with asyncio.timeout(3):
+            while len(model.active_session._reply_futs) < 1:
+                await asyncio.sleep(0)
+        first_speech = session._activity._current_speech
+        session._activity.on_end_of_turn(_end_of_turn_info(question))
+        async with asyncio.timeout(3):
+            while len(model.active_session._reply_futs) < 2:
+                await asyncio.sleep(0)
+        assert first_speech.interrupted
+        expected = [(message.id, message.text_content) for message in prepared]
+        assert [text for _, text in expected] == ["Mara,", question]
+        for context in (session.history, model.active_session.chat_ctx):
+            assert [
+                (message.id, message.text_content)
+                for message in context.messages()
+                if message.role == "user"
+            ] == expected
+        messages = utils.aio.Chan[llm.MessageGeneration]()
+        functions = utils.aio.Chan[llm.FunctionCall]()
+        messages.close()
+        functions.close()
+        model.active_session._reply_futs[-1].set_result(
+            llm.GenerationCreatedEvent(
+                message_stream=messages,
+                function_stream=functions,
+                user_initiated=True,
+                response_id="after-split-address",
+            )
+        )

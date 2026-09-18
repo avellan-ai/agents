@@ -656,6 +656,178 @@ class _FakeLiveSession:
         self._closed.set()
 
 
+async def test_external_address_survives_cancel_into_the_next_google_wire_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai.live import AsyncLive
+
+    from livekit.agents import Agent, AgentSession
+
+    from .fake_stt import FakeSTT
+    from .test_realtime_adaptive_interruption import _end_of_turn_info
+
+    sockets: list[_FakeLiveSession] = []
+    contexts: list[list[tuple[str, str | None]]] = []
+    configurations: list[Any] = []
+    prepared = []
+
+    @asynccontextmanager
+    async def connect(self: AsyncLive, **kwargs: Any) -> AsyncIterator[_FakeLiveSession]:
+        socket = _FakeLiveSession()
+        sockets.append(socket)
+        configurations.append(kwargs["config"])
+        yield socket
+
+    class PreparedAgent(Agent):
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            prepared.append(new_message)
+
+        async def realtime_context_node(self, context):
+            contexts.append(
+                [(m.id, m.text_content) for m in context.messages() if m.role == "user"]
+            )
+            return context
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    model = RealtimeModel(
+        model="gemini-3.8-live",
+        input_audio_transcription=None,
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        ),
+    )
+    question = "Explain how to tell a loose joint from a split brace. Advice only."
+
+    def sent_texts() -> list[str]:
+        return [
+            part.text
+            for socket in sockets
+            for kind, turns in socket.sent
+            if kind == "content" and turns
+            for turn in turns
+            for part in turn.parts or []
+            if part.text
+        ]
+
+    try:
+        async with AgentSession(
+            llm=model, stt=FakeSTT(), turn_handling={"turn_detection": "manual"}
+        ) as session:
+            await session.start(
+                PreparedAgent(instructions="Route present NPC questions to their agent.")
+            )
+            session._activity.on_end_of_turn(_end_of_turn_info("Mara,"))
+            async with asyncio.timeout(3):
+                while "Mara," not in sent_texts():
+                    await asyncio.sleep(0)
+            first_speech = session._activity._current_speech
+            session._activity.on_end_of_turn(_end_of_turn_info(question))
+            async with asyncio.timeout(3):
+                while question not in sent_texts():
+                    await asyncio.sleep(0)
+            assert first_speech.interrupted
+            expected = [(message.id, message.text_content) for message in prepared]
+            assert [text for _, text in expected] == ["Mara,", question]
+            assert contexts[-1] == expected
+            assert [
+                (m.id, m.text_content) for m in session.history.messages() if m.role == "user"
+            ] == expected
+            assert sent_texts().index("Mara,") < sent_texts().index(question)
+            # A fresh connection must restore the address, rather than relying
+            # on a previous socket's history after cancellation.
+            if len(sockets) > 1:
+                last_texts = [
+                    part.text
+                    for kind, turns in sockets[-1].sent
+                    if kind == "content" and turns
+                    for turn in turns
+                    for part in turn.parts or []
+                    if part.text
+                ]
+                assert "Mara," in last_texts
+                assert configurations[-1].session_resumption.handle is None
+    finally:
+        await model.aclose()
+
+
+async def test_completed_tool_free_greeting_restores_tools_for_player_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai.live import AsyncLive
+
+    from livekit.agents import Agent, AgentSession, function_tool
+
+    from .fake_io import FakeAudioOutput, FakeTextOutput
+
+    called = asyncio.Event()
+
+    class Socket(_FakeLiveSession):
+        def __init__(self):
+            super().__init__()
+            self.incoming = asyncio.Queue()
+            self.replies = 0
+
+        async def send_client_content(self, *, turns=None, turn_complete):
+            await super().send_client_content(turns=turns, turn_complete=turn_complete)
+            if not turn_complete:
+                return
+            self.replies += 1
+            if self.replies == 2:
+                self.incoming.put_nowait(
+                    types.LiveServerMessage(
+                        tool_call=types.LiveServerToolCall(
+                            function_calls=[
+                                types.FunctionCall(id="player-lookup", name="lookup", args={})
+                            ]
+                        )
+                    )
+                )
+            else:
+                self.incoming.put_nowait(
+                    types.LiveServerMessage(
+                        server_content=_audio_content(
+                            output_transcription=types.Transcription(text="Welcome."),
+                            turn_complete=True,
+                        )
+                    )
+                )
+
+        async def receive(self):
+            while not self._closed.is_set():
+                yield await self.incoming.get()
+
+    socket = Socket()
+
+    @asynccontextmanager
+    async def connect(self, **kwargs):
+        yield socket
+
+    class ToolAgent(Agent):
+        @function_tool
+        async def lookup(self) -> str:
+            """Retrieve the current facts."""
+            called.set()
+            return "Current facts."
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", connect)
+    model = RealtimeModel(model="gemini-3.8-live")
+    try:
+        async with AgentSession(llm=model) as session:
+            session.output.audio = FakeAudioOutput()
+            session.output.transcription = FakeTextOutput()
+            await session.start(ToolAgent(instructions="Use lookup for player questions."))
+            greeting = session.generate_reply(user_input="Greet briefly.", tool_choice="none")
+            await asyncio.wait_for(greeting, 3)
+            await asyncio.wait_for(session.wait_for_idle(), 3)
+            assert session._activity._rt_session._opts.tool_choice is None
+            session.generate_reply(user_input="Retrieve the facts.")
+            await asyncio.wait_for(called.wait(), 3)
+    finally:
+        await model.aclose()
+
+
 @asynccontextmanager
 async def _connected_session(
     monkeypatch: pytest.MonkeyPatch,
