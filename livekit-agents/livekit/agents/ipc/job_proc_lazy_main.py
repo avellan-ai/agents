@@ -70,12 +70,27 @@ class ProcStartArgs:
 def proc_main(args: ProcStartArgs) -> None:
     import logging
 
+    from ..plugin import Plugin
     from .log_queue import LogQueueHandler
     from .proc_client import _ProcClient
 
     root_logger = logging.getLogger()
     for name, level in args.logger_levels.items():
         logging.getLogger(name).setLevel(level)
+
+    # The parent gives every plugin logger the worker's log level (cli/log.py), but only
+    # loggers that already existed when this process was spawned are copied above. A plugin
+    # first imported by the job itself would otherwise inherit the "livekit" logger, which
+    # is silenced to WARN, and drop its INFO logs.
+    plugin_level = args.logger_levels.get("livekit.agents", logging.NOTSET)
+
+    def _configure_plugin_logger(plugin: Plugin) -> None:
+        if plugin_level and plugin.logger is not None and plugin.logger.level == logging.NOTSET:
+            plugin.logger.setLevel(plugin_level)
+
+    for plugin in Plugin.registered_plugins:
+        _configure_plugin_logger(plugin)
+    Plugin.emitter.on("plugin_registered", _configure_plugin_logger)
 
     log_cch = aio.duplex_unix._Duplex.open(args.log_cch)
     log_handler = LogQueueHandler(log_cch)

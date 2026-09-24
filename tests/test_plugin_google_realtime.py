@@ -12,6 +12,7 @@ import pytest
 from google.genai import types
 
 from livekit.agents import llm, utils
+from livekit.plugins.google.realtime import realtime_api
 from livekit.plugins.google.realtime.api_proto import ClientEvents
 from livekit.plugins.google.realtime.realtime_api import RealtimeModel, RealtimeSession
 from livekit.plugins.google.utils import create_function_response
@@ -839,13 +840,16 @@ async def _connected_session(
     sent_after_handle: llm.ChatContext | None = None,
     pending: llm.ChatContext | None = None,
     caller_handle: bool = False,
+    model: str | None = None,
+    unsent: llm.ChatContext | None = None,
 ) -> AsyncIterator[tuple[RealtimeSession, _FakeLiveSession]]:
     """Connect once onto a fake socket.
 
     `known` is the state the handle stands for, `sent_after_handle` what the previous
     socket synced after the handle arrived, `pending` the update that arrives before the
     connect loop runs. `caller_handle` passes the handle through `RealtimeModel` instead,
-    so its baseline is unknown.
+    so its baseline is unknown. `unsent` lists items of `sent_after_handle` that were
+    queued but never sent before the socket dropped.
     """
     from google.genai.live import AsyncLive
 
@@ -857,16 +861,19 @@ async def _connected_session(
 
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
     monkeypatch.setattr(AsyncLive, "connect", _connect)
+    model_kwargs = {"model": model} if model else {}
     if caller_handle:
         session = RealtimeModel(
-            session_resumption=types.SessionResumptionConfig(handle=handle)
+            session_resumption=types.SessionResumptionConfig(handle=handle), **model_kwargs
         ).session()
     else:
-        session = RealtimeModel().session()
+        session = RealtimeModel(**model_kwargs).session()
         session._session_resumption_handle = handle
     if known is not None:
         session._resumption_chat_ctx = known
         session._chat_ctx = sent_after_handle if sent_after_handle is not None else known
+    if unsent is not None:
+        session._unsent_item_ids = {item.id for item in unsent.items}
     if pending is not None:
         await session.update_chat_ctx(pending)
     try:
@@ -1696,6 +1703,56 @@ async def test_resumed_session_resends_what_the_handle_missed(
         assert session._pending_chat_ctx is None
 
 
+async def test_session_handle_holds_what_the_old_socket_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gemini 3.8's handle restores everything consumed, even after it arrived; resending
+    that would duplicate it in the resumed session (JA-1519, measured live)."""
+    known = llm.ChatContext.empty()
+    known.add_message(role="user", content="hello")
+    later = known.copy()
+    later.add_message(role="user", content="sent before the socket dropped")
+
+    async with _connected_session(
+        monkeypatch,
+        handle="resume-1",
+        known=known,
+        sent_after_handle=later,
+        model="gemini-3.8-live",
+    ) as (session, fake):
+        assert fake.sent == []
+        assert [m.text_content for m in session.chat_ctx.messages()] == [
+            "hello",
+            "sent before the socket dropped",
+        ]
+
+
+async def test_session_handle_resends_only_what_never_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Items queued but not sent before a restart are new to the resumed 3.8 session."""
+    known = llm.ChatContext.empty()
+    known.add_message(role="user", content="hello")
+    later = known.copy()
+    later.add_message(role="user", content="sent before the socket dropped")
+    never_sent = llm.ChatContext.empty()
+    never_sent.add_message(role="user", content="queued when it dropped")
+    later.items.extend(never_sent.items)
+    updated = later.copy()
+    updated.add_message(role="user", content="arrived during the restart")
+
+    async with _connected_session(
+        monkeypatch,
+        handle="resume-1",
+        known=known,
+        sent_after_handle=later,
+        unsent=never_sent,
+        pending=updated,
+        model="gemini-3.8-live",
+    ) as (_, fake):
+        assert _texts(fake.sent) == [["queued when it dropped", "arrived during the restart"]]
+
+
 async def test_caller_provided_handle_adopts_the_history_without_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2095,11 +2152,14 @@ async def test_rejected_resumption_handle_reconnects_fresh_with_the_history(
 ) -> None:
     from google.genai import errors as genai_errors
 
+    """A handle refused twice is dropped; the fresh connection replays the history."""
+    monkeypatch.setattr(realtime_api, "RESUME_SETTLE_DELAY", 0.05)
     history = llm.ChatContext.empty()
     history.add_message(role="user", content="I open the gate.")
     history.add_message(role="assistant", content="It creaks open.")
     fresh = _ScriptedSocket()
-    server = _Server(genai_errors.APIError(1008, {"message": "invalid handle"}), fresh)
+    refused = genai_errors.APIError(1008, {"message": "invalid handle"})
+    server = _Server(refused, refused, fresh)
     async with _rotating_session(
         server,
         monkeypatch,
@@ -2107,9 +2167,77 @@ async def test_rejected_resumption_handle_reconnects_fresh_with_the_history(
     ) as (session, errors):
         await session.update_chat_ctx(history)
         await _eventually(lambda: fresh.sent)
-        assert server.handles == ["expired", None]
+        assert server.handles == ["expired", "expired", None]
         assert _texts(fresh.sent) == [["I open the gate.", "It creaks open."]]
         assert not [e for e in errors if not e.recoverable]
+
+
+async def test_a_handle_refused_once_is_retried_before_replaying_history(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Gemini refuses a handle (1011) while it settles the last streamed audio; the same
+    handle resumes a moment later (JA-1519, measured live on gemini-3.8-live)."""
+    monkeypatch.setattr(realtime_api, "RESUME_SETTLE_DELAY", 0.05)
+    first, resumed = _ScriptedSocket(), _ScriptedSocket()
+    server = _Server(first, _internal_error(), resumed)
+    async with _rotating_session(server, monkeypatch, max_connection_age=0.2) as (
+        session,
+        errors,
+    ):
+        with caplog.at_level(logging.INFO, logger="livekit.plugins.google"):
+            await _eventually(lambda: server.opened)
+            first.serve(_handle_update("handle-1"))
+            await _eventually(lambda: len(server.opened) == 2)
+            await _eventually(
+                lambda: any(r.getMessage() == "Gemini connection rotated" for r in caplog.records)
+            )
+        assert server.handles == [None, "handle-1", "handle-1"]
+        assert resumed.sent == []
+        rotated = [r for r in caplog.records if r.getMessage() == "Gemini connection rotated"]
+        assert [(r.reason, r.resumed) for r in rotated] == [("max_age", True)]  # type: ignore[attr-defined]
+        assert errors == []
+
+
+async def test_resume_waits_for_streamed_audio_to_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resume right after the last streamed frame is refused, so the connect waits."""
+    from livekit import rtc
+    from livekit.plugins.google.realtime.realtime_api import INPUT_AUDIO_SAMPLE_RATE
+
+    monkeypatch.setattr(realtime_api, "RESUME_SETTLE_DELAY", 0.3)
+    first = _ScriptedSocket()
+    server = _Server(first)
+    connected_at: list[float] = []
+    original_install = server.install
+
+    def install(mp: pytest.MonkeyPatch) -> None:
+        original_install(mp)
+        from google.genai.live import AsyncLive
+
+        inner = AsyncLive.connect
+
+        @asynccontextmanager
+        async def timed(live: Any, **kwargs: Any) -> AsyncIterator[Any]:
+            connected_at.append(asyncio.get_running_loop().time())
+            async with inner(live, **kwargs) as socket:
+                yield socket
+
+        mp.setattr(AsyncLive, "connect", timed)
+
+    server.install = install  # type: ignore[method-assign]
+    async with _rotating_session(server, monkeypatch) as (session, errors):
+        await _eventually(lambda: server.opened)
+        first.serve(_handle_update("handle-1"))
+        data = b"\x00" * (INPUT_AUDIO_SAMPLE_RATE // 20 * 2)
+        session.push_audio(rtc.AudioFrame(data, INPUT_AUDIO_SAMPLE_RATE, 1, len(data) // 2))
+        await _eventually(lambda: first.sent)
+        sent_at = asyncio.get_running_loop().time()
+        first.serve(_internal_error())
+        await _eventually(lambda: len(server.opened) == 2)
+        assert server.handles == [None, "handle-1"]
+        assert connected_at[1] - sent_at >= 0.25
+        assert errors == []
 
 
 async def test_a_second_failure_after_the_reconnect_budget_is_still_fatal(

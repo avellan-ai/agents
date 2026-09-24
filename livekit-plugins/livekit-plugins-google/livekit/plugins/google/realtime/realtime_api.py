@@ -69,6 +69,11 @@ DEFAULT_MAX_CONNECTION_AGE = 540.0
 GO_AWAY_SAFETY_MARGIN = 1.5
 # Assumed remaining time when GoAway omits timeLeft.
 GO_AWAY_DEFAULT_TIME_LEFT = 5.0
+# Gemini Live rejects a resumption handle with 1011 while it is still settling audio or
+# video received just before the previous socket closed (JA-1519: 4/4 resumes within 0.4s
+# of the last streamed frame failed, 4/4 after a 1s pause succeeded). Resume only this long
+# after the last media frame was sent.
+RESUME_SETTLE_DELAY = 1.5
 _ROTATION_POLL_INTERVAL = 0.1
 
 
@@ -114,6 +119,16 @@ def _needs_reply_placeholder(model: str) -> bool:
 # These models declare tools NON_BLOCKING unless the client says otherwise. Sending nothing
 # would leave the server async while we still treat the tools as blocking.
 MODELS_DEFAULT_NON_BLOCKING: tuple[str, ...] = ("3.8",)
+
+
+# On these models a resumption handle restores everything the server consumed before the
+# socket closed, including content sent after the handle arrived (each connection sends one
+# handle, near its start). Older models snapshot the session at each handle instead.
+MODELS_WITH_SESSION_HANDLE: tuple[str, ...] = ("3.8",)
+
+
+def _handle_restores_consumed_input(model: str) -> bool:
+    return any(tag in model for tag in MODELS_WITH_SESSION_HANDLE)
 
 
 def _default_tool_behavior(model: str) -> NotGivenOr[types.Behavior]:
@@ -660,6 +675,10 @@ class RealtimeSession(llm.RealtimeSession):
         self._go_away_deadline: float | None = None
         # (reason, connection age) of a rotation in progress, logged once reconnected
         self._rotation: tuple[str, float] | None = None
+        # when the last audio or video frame went out, and whether the stored handle has
+        # already been refused once; see RESUME_SETTLE_DELAY
+        self._last_media_sent_at: float | None = None
+        self._resume_refused = False
 
     async def _close_active_session(self) -> None:
         async with self._session_lock:
@@ -1192,6 +1211,12 @@ class RealtimeSession(llm.RealtimeSession):
             session = None
             resumed_with = self._session_resumption_handle
             try:
+                if resumed_with is not None and self._last_media_sent_at is not None:
+                    settle = self._last_media_sent_at + RESUME_SETTLE_DELAY - time.monotonic()
+                    if settle > 0:
+                        await asyncio.sleep(settle)
+                    # a context reset while waiting may have dropped the handle
+                    resumed_with = self._session_resumption_handle
                 config = self._build_connect_config()
                 logger.debug("connecting to Gemini Realtime API...")
                 t0 = time.perf_counter()
@@ -1200,6 +1225,7 @@ class RealtimeSession(llm.RealtimeSession):
                 ) as session:
                     self._report_connection_acquired(time.perf_counter() - t0)
                     connected_once = True
+                    self._resume_refused = False
                     async with self._session_lock:
                         self._active_session = session
                         if self._session_should_close.is_set():
@@ -1212,7 +1238,7 @@ class RealtimeSession(llm.RealtimeSession):
                             if self._resumption_chat_ctx is None:
                                 self._chat_ctx = target
                             else:
-                                self._sync_chat_ctx(target, known=self._resumption_chat_ctx)
+                                self._sync_chat_ctx(target, known=self._resumed_chat_ctx())
                         else:
                             if pending_ctx is not None:
                                 self._chat_ctx = pending_ctx
@@ -1329,8 +1355,20 @@ class RealtimeSession(llm.RealtimeSession):
 
                 if not self._msg_ch.closed:
                     if session is None and resumed_with is not None:
+                        self._num_retries += 1
+                        if not self._resume_refused:
+                            # Usually the server is still settling the last streamed media;
+                            # the same handle resumes a moment later.
+                            self._resume_refused = True
+                            logger.warning(
+                                "Gemini Live refused the session handle; retrying it shortly",
+                                exc_info=e,
+                            )
+                            await asyncio.sleep(RESUME_SETTLE_DELAY)
+                            continue
                         # An expired or rejected handle. A fresh connect is a different
                         # request: drop the handle and replay the history instead.
+                        self._resume_refused = False
                         if self._session_resumption_handle == resumed_with:
                             self._session_resumption_handle = None
                             self._resumption_chat_ctx = None
@@ -1339,7 +1377,6 @@ class RealtimeSession(llm.RealtimeSession):
                             "full chat history",
                             exc_info=e,
                         )
-                        self._num_retries += 1
                         continue
 
                     # 1007 also covers invalid activity sequencing, not only exhausted
@@ -1406,8 +1443,10 @@ class RealtimeSession(llm.RealtimeSession):
                 elif isinstance(msg, types.LiveClientRealtimeInput):
                     if msg.audio:
                         await session.send_realtime_input(audio=msg.audio)
+                        self._last_media_sent_at = time.monotonic()
                     elif msg.video:
                         await session.send_realtime_input(video=msg.video)
+                        self._last_media_sent_at = time.monotonic()
                     elif msg.text:
                         await session.send_realtime_input(text=msg.text)
                     elif msg.activity_start:
@@ -1599,6 +1638,15 @@ class RealtimeSession(llm.RealtimeSession):
             conf.context_window_compression = self._opts.context_window_compression
 
         return conf
+
+    def _resumed_chat_ctx(self) -> llm.ChatContext | None:
+        """The history a resumed session already holds, so only the rest is sent."""
+        if _handle_restores_consumed_input(self._opts.model):
+            # everything the earlier sockets sent, not just what preceded the handle
+            return llm.ChatContext(
+                [item for item in self._chat_ctx.items if item.id not in self._unsent_item_ids]
+            )
+        return self._resumption_chat_ctx
 
     def _rerequest_pending_reply(self) -> None:
         # A reply requested on a socket that has since been retired never started. Ask the
