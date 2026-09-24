@@ -62,6 +62,26 @@ class _ChatCtxToolResponse(types.LiveClientToolResponse):
 # stop rejecting tool calls after this many in a row to avoid a loop (tool_choice="none")
 MAX_TOOL_CALL_REJECTIONS = 3
 
+# A Gemini Live connection lasts about 10 minutes. Rotate it between turns before then,
+# resuming the session, so the server-side cutoff never lands mid-reply.
+DEFAULT_MAX_CONNECTION_AGE = 540.0
+# After GoAway, rotate this long before the server's announced cutoff at the latest.
+GO_AWAY_SAFETY_MARGIN = 1.5
+# Assumed remaining time when GoAway omits timeLeft.
+GO_AWAY_DEFAULT_TIME_LEFT = 5.0
+_ROTATION_POLL_INTERVAL = 0.1
+
+
+def _parse_duration(value: str | None) -> float | None:
+    """Parse a protobuf JSON duration such as "8.5s"."""
+    if not value:
+        return None
+    try:
+        return float(value.removesuffix("s"))
+    except ValueError:
+        return None
+
+
 # Known VertexAI models for the Live API
 # See: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api
 KNOWN_VERTEXAI_MODELS: frozenset[str] = frozenset(
@@ -246,6 +266,7 @@ class _RealtimeOptions:
     thinking_config: NotGivenOr[types.ThinkingConfig] = NOT_GIVEN
     session_resumption: NotGivenOr[types.SessionResumptionConfig] = NOT_GIVEN
     credentials: google.auth.credentials.Credentials | None = None
+    max_connection_age: float | None = DEFAULT_MAX_CONNECTION_AGE
 
 
 @dataclass
@@ -325,6 +346,7 @@ class RealtimeModel(llm.RealtimeModel):
         media_resolution: NotGivenOr[types.MediaResolution] = NOT_GIVEN,
         thinking_config: NotGivenOr[types.ThinkingConfig] = NOT_GIVEN,
         credentials: google.auth.credentials.Credentials | None = None,
+        max_connection_age: float | None = DEFAULT_MAX_CONNECTION_AGE,
     ) -> None:
         """
         Initializes a RealtimeModel instance for interacting with Google's Realtime API.
@@ -365,6 +387,7 @@ class RealtimeModel(llm.RealtimeModel):
             session_resumption (SessionResumptionConfig, optional): The configuration for session resumption. Defaults to None.
             thinking_config (ThinkingConfig, optional): Native audio thinking configuration.
             conn_options (APIConnectOptions, optional): The configuration for the API connection. Defaults to DEFAULT_API_CONNECT_OPTIONS.
+            max_connection_age (float | None, optional): Rotate the connection between turns, resuming the session, once it is this many seconds old, ahead of the server's ~10 minute connection limit. None disables proactive rotation; GoAway still rotates. Defaults to 540.
 
         Raises:
             ValueError: If the API key is required but not found.
@@ -484,6 +507,7 @@ class RealtimeModel(llm.RealtimeModel):
             thinking_config=thinking_config,
             session_resumption=session_resumption,
             credentials=credentials,
+            max_connection_age=max_connection_age,
         )
 
         self._sessions = weakref.WeakSet[RealtimeSession]()
@@ -623,6 +647,19 @@ class RealtimeSession(llm.RealtimeSession):
         # error recorded by the recv/send tasks so _main_task can bound retries
         # and surface it through the "error" event
         self._session_error: Exception | None = None
+
+        # the reply request of the pending generate_reply, and the channel it was queued on;
+        # a restart replaces the channel, so the request is re-sent to the next socket
+        self._pending_reply_request: types.LiveClientContent | None = None
+        self._pending_reply_ch: utils.aio.Chan[ClientEvents] | None = None
+        # tool calls the model is waiting on, and whether a sent tool result asks for a reply
+        self._open_tool_call_ids: set[str] = set()
+        self._reply_expected = False
+        # set by GoAway: rotate at the next turn boundary, and by this deadline at the latest
+        self._go_away = asyncio.Event()
+        self._go_away_deadline: float | None = None
+        # (reason, connection age) of a rotation in progress, logged once reconnected
+        self._rotation: tuple[str, float] | None = None
 
     async def _close_active_session(self) -> None:
         async with self._session_lock:
@@ -771,6 +808,8 @@ class RealtimeSession(llm.RealtimeSession):
         self._pending_chat_ctx = chat_ctx.copy()
         self._session_resumption_handle = None
         self._resumption_chat_ctx = None
+        self._open_tool_call_ids.clear()
+        self._reply_expected = False
         if self._pending_generation_fut and not self._pending_generation_fut.done():
             pending, self._pending_generation_fut = self._pending_generation_fut, None
             pending.cancel("Chat context replaced before generation began")
@@ -857,10 +896,15 @@ class RealtimeSession(llm.RealtimeSession):
                         function_responses=tool_results.function_responses, item_ids=item_ids
                     )
                 )
+                self._reply_expected |= any(
+                    response.scheduling != types.FunctionResponseScheduling.SILENT
+                    for response in tool_results.function_responses or []
+                )
             elif self.capabilities.auto_tool_reply_generation and any(
                 item.reply_required for item in retired_results
             ):
                 self._send_client_event(types.LiveClientContent(turn_complete=True))
+                self._reply_expected = True
 
         # since we don't have a view of the history on the server side, we'll assume
         # the current state is accurate. this isn't perfect because removals aren't done.
@@ -1000,7 +1044,9 @@ class RealtimeSession(llm.RealtimeSession):
             )
         if _needs_reply_placeholder(self._opts.model):
             turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
-        self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
+        request = types.LiveClientContent(turns=turns, turn_complete=True)
+        self._pending_reply_request, self._pending_reply_ch = request, self._msg_ch
+        self._send_client_event(request)
 
         def _on_timeout() -> None:
             if not fut.done():
@@ -1133,6 +1179,7 @@ class RealtimeSession(llm.RealtimeSession):
     @utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
         max_retries = self._opts.conn_options.max_retry
+        connected_once = False
 
         while not self._msg_ch.closed:
             # previous session might not be closed yet, we'll do it here.
@@ -1143,6 +1190,7 @@ class RealtimeSession(llm.RealtimeSession):
             # replacement's queued input, even if its handshake finishes late.
             msg_ch = self._msg_ch
             session = None
+            resumed_with = self._session_resumption_handle
             try:
                 config = self._build_connect_config()
                 logger.debug("connecting to Gemini Realtime API...")
@@ -1151,6 +1199,7 @@ class RealtimeSession(llm.RealtimeSession):
                     model=self._opts.model, config=config
                 ) as session:
                     self._report_connection_acquired(time.perf_counter() - t0)
+                    connected_once = True
                     async with self._session_lock:
                         self._active_session = session
                         if self._session_should_close.is_set():
@@ -1210,6 +1259,23 @@ class RealtimeSession(llm.RealtimeSession):
                                     turn_complete=False,
                                 )
                             self._unsent_item_ids.clear()
+                            # every earlier call is retired above; none is open on this socket
+                            self._open_tool_call_ids.clear()
+
+                        self._rerequest_pending_reply()
+                        self._go_away.clear()
+                        self._go_away_deadline = None
+                        if self._rotation is not None:
+                            reason, age = self._rotation
+                            self._rotation = None
+                            logger.info(
+                                "Gemini connection rotated",
+                                extra={
+                                    "reason": reason,
+                                    "age_s": round(age, 1),
+                                    "resumed": resumed_with is not None,
+                                },
+                            )
 
                     # queue up existing chat context
                     send_task = asyncio.create_task(
@@ -1221,10 +1287,14 @@ class RealtimeSession(llm.RealtimeSession):
                     restart_wait_task = asyncio.create_task(
                         self._session_should_close.wait(), name="gemini-restart-wait"
                     )
+                    rotation_task = asyncio.create_task(
+                        self._rotation_task(connected_at=time.monotonic()),
+                        name="gemini-rotation",
+                    )
 
                     try:
                         done, _ = await asyncio.wait(
-                            [send_task, recv_task, restart_wait_task],
+                            [send_task, recv_task, restart_wait_task, rotation_task],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
 
@@ -1243,7 +1313,9 @@ class RealtimeSession(llm.RealtimeSession):
                             raise err
                     finally:
                         # Cancellation and errors must retire every socket-owned task.
-                        await utils.aio.cancel_and_wait(send_task, recv_task, restart_wait_task)
+                        await utils.aio.cancel_and_wait(
+                            send_task, recv_task, restart_wait_task, rotation_task
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -1256,6 +1328,20 @@ class RealtimeSession(llm.RealtimeSession):
                     logger.error(f"Gemini Realtime API error: {e}", exc_info=e)
 
                 if not self._msg_ch.closed:
+                    if session is None and resumed_with is not None:
+                        # An expired or rejected handle. A fresh connect is a different
+                        # request: drop the handle and replay the history instead.
+                        if self._session_resumption_handle == resumed_with:
+                            self._session_resumption_handle = None
+                            self._resumption_chat_ctx = None
+                        logger.warning(
+                            "Gemini Live did not resume the session; reconnecting with the "
+                            "full chat history",
+                            exc_info=e,
+                        )
+                        self._num_retries += 1
+                        continue
+
                     # 1007 also covers invalid activity sequencing, not only exhausted
                     # context. Replaying the unchanged request can fail identically;
                     # retain the provider error without guessing a specific cause.
@@ -1271,23 +1357,27 @@ class RealtimeSession(llm.RealtimeSession):
                             message="Gemini Live request rejected (1007)"
                         ) from e
 
-                    # we shouldn't retry when it's not connected, usually this means incorrect
+                    # we shouldn't retry when it never connected, usually this means incorrect
                     # parameters or setup
-                    if not session or max_retries == 0:
+                    if not session and not connected_once:
                         self._emit_error(e, recoverable=False)
                         error_msg = "Failed to connect to Gemini Live"
                         if hint:
                             error_msg += hint
                         raise APIConnectionError(message=error_msg) from e
 
-                    if self._num_retries == max_retries:
+                    # A live connection that drops (e.g. 1011 internal error, or the server
+                    # ending it before a rotation) always gets one reconnect, resuming it;
+                    # later failures count against max_retry.
+                    if self._num_retries >= (attempts := max(max_retries, 1)):
                         self._emit_error(e, recoverable=False)
-                        error_msg = f"Failed to connect to Gemini Live after {max_retries} attempts"
+                        error_msg = f"Failed to connect to Gemini Live after {attempts} attempts"
                         if hint:
                             error_msg += hint
                         raise APIConnectionError(message=error_msg) from e
 
-                    self._emit_error(e, recoverable=True)
+                    if self._num_retries > 0:
+                        self._emit_error(e, recoverable=True)
                     retry_interval = self._opts.conn_options._interval_for_retry(self._num_retries)
                     logger.warning(
                         f"Gemini Realtime API connection failed, retrying in {retry_interval}s",
@@ -1510,8 +1600,23 @@ class RealtimeSession(llm.RealtimeSession):
 
         return conf
 
+    def _rerequest_pending_reply(self) -> None:
+        # A reply requested on a socket that has since been retired never started. Ask the
+        # new socket for it instead of letting generate_reply time out.
+        fut = self._pending_generation_fut
+        if (
+            fut is not None
+            and not fut.done()
+            and self._pending_reply_request is not None
+            and self._pending_reply_ch is not self._msg_ch
+        ):
+            logger.debug("re-requesting the pending reply on the new Gemini connection")
+            self._pending_reply_ch = self._msg_ch
+            self._send_client_event(self._pending_reply_request)
+
     def _start_new_generation(self) -> None:
         self._rejected_tool_calls = 0
+        self._reply_expected = False
         if self._current_generation and not self._current_generation._done:
             logger.warning("starting new generation while another is active. Finalizing previous.")
             self._mark_current_generation_done()
@@ -1767,6 +1872,7 @@ class RealtimeSession(llm.RealtimeSession):
                 arguments=arguments,
             )
             self._retired_tool_call_ids.discard(call.call_id)
+            self._open_tool_call_ids.add(call.call_id)
             self._chat_ctx.items.append(call)
             gen.function_ch.send_nowait(call)
         self._mark_current_generation_done()
@@ -1778,6 +1884,7 @@ class RealtimeSession(llm.RealtimeSession):
             "server cancelled tool calls",
             extra={"function_call_ids": tool_call_cancellation.ids},
         )
+        self._open_tool_call_ids.difference_update(tool_call_cancellation.ids or [])
 
     def _handle_usage_metadata(self, usage_metadata: types.UsageMetadata) -> None:
         current_gen = self._current_generation
@@ -1849,11 +1956,64 @@ class RealtimeSession(llm.RealtimeSession):
         self.emit("metrics_collected", metrics)
 
     def _handle_go_away(self, go_away: types.LiveServerGoAway) -> None:
-        logger.warning(
-            f"Gemini server indicates disconnection soon. Time left: {go_away.time_left}"
+        # Let the current reply and tool calls finish, then rotate (see _rotation_task).
+        time_left = _parse_duration(go_away.time_left)
+        wait = (time_left if time_left is not None else GO_AWAY_DEFAULT_TIME_LEFT) - (
+            GO_AWAY_SAFETY_MARGIN
         )
-        # TODO(dz): this isn't a seamless reconnection just yet
-        self._session_should_close.set()
+        self._go_away_deadline = time.monotonic() + max(wait, 0.0)
+        self._go_away.set()
+        logger.info(
+            "Gemini connection ending soon; rotating at the next turn boundary",
+            extra={"time_left": go_away.time_left},
+        )
+
+    def _between_turns(self) -> bool:
+        """Whether a rotation now would cut nothing: no reply, pending request or tool call."""
+        gen = self._current_generation
+        if gen is not None and not gen._done:
+            return False
+        if self._pending_generation_fut is not None and not self._pending_generation_fut.done():
+            return False
+        if self._in_user_activity or self._reply_expected:
+            return False
+        answered = {
+            item.call_id
+            for item in self._chat_ctx.items
+            if isinstance(item, llm.FunctionCallOutput) and item.id not in self._unsent_item_ids
+        }
+        return self._open_tool_call_ids <= answered
+
+    async def _rotation_task(self, *, connected_at: float) -> None:
+        """Retire this connection between turns, before Gemini cuts it off.
+
+        Rotation starts on GoAway or, failing that, once the connection reaches
+        max_connection_age. It waits for a turn boundary, bounded only by the GoAway
+        deadline, then restarts; the next connect resumes with the stored handle.
+        """
+        max_age = self._opts.max_connection_age
+        reason = "go_away"
+        try:
+            await asyncio.wait_for(
+                self._go_away.wait(),
+                None if max_age is None else max(connected_at + max_age - time.monotonic(), 0),
+            )
+        except asyncio.TimeoutError:
+            reason = "max_age"
+
+        while not self._between_turns():
+            deadline = self._go_away_deadline
+            if deadline is not None and time.monotonic() >= deadline:
+                reason = "go_away_deadline"
+                break
+            await asyncio.sleep(_ROTATION_POLL_INTERVAL)
+
+        if self._session_should_close.is_set():
+            return  # already restarting for another reason
+        if reason == "max_age" and self._go_away.is_set():
+            reason = "go_away"
+        self._rotation = (reason, time.monotonic() - connected_at)
+        self._mark_restart_needed()
 
     def commit_audio(self) -> None:
         logger.warning("commit_audio is not supported by Gemini Realtime API.")

@@ -1866,3 +1866,261 @@ def test_explicit_tool_behavior_wins_over_the_model_default(
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
     model = RealtimeModel(model="gemini-3.8-live", tool_behavior=types.Behavior.BLOCKING)
     assert model._opts.tool_behavior == types.Behavior.BLOCKING
+
+
+# -- connection rotation ------------------------------------------------------------------
+
+
+class _ScriptedSocket(_FakeLiveSession):
+    """A live socket whose server messages (or a failure to raise) the test feeds in."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.incoming: asyncio.Queue[types.LiveServerMessage | Exception] = asyncio.Queue()
+
+    def serve(self, message: types.LiveServerMessage | Exception) -> None:
+        self.incoming.put_nowait(message)
+
+    async def receive(self) -> AsyncIterator[types.LiveServerMessage]:
+        while True:
+            message = await self.incoming.get()
+            if isinstance(message, Exception):
+                raise message
+            yield message
+
+
+class _Server:
+    """Hands out scripted sockets; an exception in `connects` fails that connect attempt."""
+
+    def __init__(self, *connects: _ScriptedSocket | Exception) -> None:
+        self.connects = list(connects)
+        self.configs: list[types.LiveConnectConfig] = []
+        self.opened: list[_ScriptedSocket] = []
+
+    @property
+    def handles(self) -> list[str | None]:
+        return [c.session_resumption.handle for c in self.configs if c.session_resumption]
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from google.genai.live import AsyncLive
+
+        @asynccontextmanager
+        async def connect(live: AsyncLive, **kwargs: Any) -> AsyncIterator[_ScriptedSocket]:
+            self.configs.append(kwargs["config"])
+            outcome = self.connects.pop(0) if self.connects else _ScriptedSocket()
+            if isinstance(outcome, Exception):
+                raise outcome
+            self.opened.append(outcome)
+            yield outcome
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+        monkeypatch.setattr(AsyncLive, "connect", connect)
+
+
+def _handle_update(handle: str) -> types.LiveServerMessage:
+    return types.LiveServerMessage(
+        session_resumption_update=types.LiveServerSessionResumptionUpdate(
+            new_handle=handle, resumable=True
+        )
+    )
+
+
+def _speech(**kwargs: object) -> types.LiveServerMessage:
+    return types.LiveServerMessage(server_content=_audio_content(**kwargs))
+
+
+def _internal_error() -> Exception:
+    from google.genai import errors
+
+    return errors.APIError(1011, {"message": "Internal error"})
+
+
+async def _eventually(condition: Any, timeout: float = 2.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.01)
+
+
+@asynccontextmanager
+async def _rotating_session(
+    server: _Server, monkeypatch: pytest.MonkeyPatch, **options: Any
+) -> AsyncIterator[tuple[RealtimeSession, list[llm.RealtimeModelError]]]:
+    from livekit.agents import APIConnectOptions
+
+    server.install(monkeypatch)
+    # Delphi's current setting: no retries configured at all
+    options.setdefault("conn_options", APIConnectOptions(max_retry=0, timeout=5))
+    session = RealtimeModel(model="gemini-3.8-live", **options).session()
+    errors: list[llm.RealtimeModelError] = []
+    session.on("error", errors.append)
+    try:
+        yield session, errors
+    finally:
+        await session.aclose()
+
+
+async def test_go_away_lets_the_reply_finish_then_resumes_on_a_new_connection(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    first = _ScriptedSocket()
+    server = _Server(first)
+    async with _rotating_session(server, monkeypatch) as (session, errors):
+        generations: list[llm.GenerationCreatedEvent] = []
+        session.on("generation_created", generations.append)
+        await _eventually(lambda: server.opened)
+        first.serve(_handle_update("handle-1"))
+        first.serve(_speech())
+        await _eventually(lambda: generations)
+        drained = asyncio.create_task(_drain_generation(generations[0]))
+
+        with caplog.at_level(logging.INFO, logger="livekit.plugins.google"):
+            first.serve(types.LiveServerMessage(go_away=types.LiveServerGoAway(time_left="30s")))
+            await asyncio.sleep(0.3)
+            assert len(server.opened) == 1, "GoAway must not cut the reply in progress"
+
+            first.serve(_speech(generation_complete=True))
+            first.serve(
+                types.LiveServerMessage(server_content=types.LiveServerContent(turn_complete=True))
+            )
+            await _eventually(lambda: len(server.opened) == 2)
+            await _eventually(
+                lambda: any(r.getMessage() == "Gemini connection rotated" for r in caplog.records)
+            )
+
+        _, audio_frames, _ = await asyncio.wait_for(drained, 1)
+        assert audio_frames == 2
+        assert server.handles == [None, "handle-1"]
+        assert errors == []
+        rotated = [r for r in caplog.records if r.getMessage() == "Gemini connection rotated"]
+        assert [(r.reason, r.resumed) for r in rotated] == [("go_away", True)]  # type: ignore[attr-defined]
+
+
+async def test_go_away_rotates_by_its_deadline_even_when_the_reply_never_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _ScriptedSocket()
+    server = _Server(first)
+    async with _rotating_session(server, monkeypatch) as (session, errors):
+        await _eventually(lambda: server.opened)
+        first.serve(_handle_update("handle-1"))
+        first.serve(_speech())
+        first.serve(types.LiveServerMessage(go_away=types.LiveServerGoAway(time_left="1.7s")))
+        # 1.7s minus the 1.5s safety margin
+        await _eventually(lambda: len(server.opened) == 2, timeout=1.0)
+        assert server.handles == [None, "handle-1"]
+        assert errors == []
+
+
+async def test_proactive_rotation_waits_for_a_turn_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _ScriptedSocket()
+    server = _Server(first)
+    async with _rotating_session(server, monkeypatch, max_connection_age=0.2) as (
+        session,
+        errors,
+    ):
+        await _eventually(lambda: server.opened)
+        first.serve(_handle_update("handle-1"))
+        first.serve(_speech())
+        await asyncio.sleep(0.5)
+        assert len(server.opened) == 1, "an aged connection must not rotate mid-reply"
+
+        first.serve(_speech(generation_complete=True, turn_complete=True))
+        await _eventually(lambda: len(server.opened) == 2)
+        assert server.handles == [None, "handle-1"]
+        assert errors == []
+
+
+async def test_pending_reply_request_waits_out_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_reply before the server answers is a turn in progress, not a boundary."""
+    first = _ScriptedSocket()
+    server = _Server(first)
+    async with _rotating_session(server, monkeypatch, max_connection_age=0.2) as (
+        session,
+        errors,
+    ):
+        await _eventually(lambda: server.opened)
+        reply = session.generate_reply()
+        await asyncio.sleep(0.5)
+        assert len(server.opened) == 1
+
+        first.serve(_speech(generation_complete=True, turn_complete=True))
+        await asyncio.wait_for(reply, 1)
+        await _eventually(lambda: len(server.opened) == 2)
+        assert errors == []
+
+
+async def test_internal_error_on_a_live_connection_reconnects_and_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _ScriptedSocket()
+    server = _Server(first)
+    async with _rotating_session(server, monkeypatch) as (session, errors):
+        await _eventually(lambda: server.opened)
+        first.serve(_handle_update("handle-1"))
+        first.serve(_internal_error())
+        await _eventually(lambda: len(server.opened) == 2)
+        await asyncio.sleep(0.1)
+        assert server.handles == [None, "handle-1"]
+        assert errors == []
+
+
+async def test_reply_pending_when_the_socket_drops_is_requested_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, second = _ScriptedSocket(), _ScriptedSocket()
+    server = _Server(first, second)
+    async with _rotating_session(server, monkeypatch) as (session, errors):
+        await _eventually(lambda: server.opened)
+        first.serve(_handle_update("handle-1"))
+        reply = session.generate_reply(instructions="Describe the gate.")
+        await _eventually(lambda: first.sent)
+        first.serve(_internal_error())
+
+        await _eventually(lambda: second.sent)
+        assert _texts(second.sent) == [
+            ["Application response instructions (not dialogue):\nDescribe the gate."]
+        ]
+        second.serve(_speech(generation_complete=True, turn_complete=True))
+        created = await asyncio.wait_for(reply, 1)
+        assert created.user_initiated
+        assert errors == []
+
+
+async def test_rejected_resumption_handle_reconnects_fresh_with_the_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.genai import errors as genai_errors
+
+    history = llm.ChatContext.empty()
+    history.add_message(role="user", content="I open the gate.")
+    history.add_message(role="assistant", content="It creaks open.")
+    fresh = _ScriptedSocket()
+    server = _Server(genai_errors.APIError(1008, {"message": "invalid handle"}), fresh)
+    async with _rotating_session(
+        server,
+        monkeypatch,
+        session_resumption=types.SessionResumptionConfig(handle="expired"),
+    ) as (session, errors):
+        await session.update_chat_ctx(history)
+        await _eventually(lambda: fresh.sent)
+        assert server.handles == ["expired", None]
+        assert _texts(fresh.sent) == [["I open the gate.", "It creaks open."]]
+        assert not [e for e in errors if not e.recoverable]
+
+
+async def test_a_second_failure_after_the_reconnect_budget_is_still_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconnect is bounded: a live drop followed by a failed reconnect ends the session."""
+    first = _ScriptedSocket()
+    server = _Server(first, _internal_error())
+    async with _rotating_session(server, monkeypatch) as (session, errors):
+        await _eventually(lambda: server.opened)
+        first.serve(_internal_error())
+        await _eventually(lambda: errors)
+        assert [e.recoverable for e in errors] == [False]
+        assert len(server.configs) == 2
